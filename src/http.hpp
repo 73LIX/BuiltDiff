@@ -1,4 +1,4 @@
-// http.hpp - tiny HTTP/1.1 POST client for talking to a local Ollama server.
+// http.hpp - tiny HTTP/1.1 client for talking to a local Ollama server.
 //
 // Deliberately small and strict:
 //   * plain TCP only; loopback addresses only unless allow_remote is set
@@ -40,6 +40,12 @@ struct HttpResult {
 HttpResult http_post_json(const HttpEndpoint& ep, const std::string& path, const std::string& json_body,
                           const std::function<bool(int status, std::string_view chunk)>& on_body,
                           const HttpLimits& limits = {});
+
+// Same, but GET with no request body. Ollama's /api/tags rejects POST with 405,
+// so model discovery needs this.
+HttpResult http_get(const HttpEndpoint& ep, const std::string& path,
+                    const std::function<bool(int status, std::string_view chunk)>& on_body,
+                    const HttpLimits& limits = {});
 
 // Parses "host", "host:port", "http://host:port" (what OLLAMA_HOST usually looks like).
 bool parse_endpoint(std::string_view spec, HttpEndpoint& out);

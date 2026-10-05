@@ -239,8 +239,12 @@ bool ChunkedDecoder::feed(std::string_view in, std::string& out) {
   return state_ != State::Error;
 }
 
-HttpResult http_post_json(const HttpEndpoint& ep, const std::string& path, const std::string& json_body,
-                          const std::function<bool(int, std::string_view)>& on_body, const HttpLimits& limits) {
+namespace {
+
+// Shared request path. `method` is one of the two literals below; an empty
+// `body` means no Content-Type/Content-Length headers are sent.
+HttpResult exchange(const HttpEndpoint& ep, const char* method, const std::string& path, const std::string& body,
+                    const std::function<bool(int, std::string_view)>& on_body, const HttpLimits& limits) {
   HttpResult res;
   const auto start = Clock::now();
   const auto total_deadline = start + limits.total_timeout;
@@ -248,11 +252,13 @@ HttpResult http_post_json(const HttpEndpoint& ep, const std::string& path, const
   Sock s(connect_to(ep, limits.connect_timeout, res.error));
   if (s.fd < 0) return res;
 
-  std::string req = "POST " + path + " HTTP/1.1\r\nHost: " + ep.host + ":" + std::to_string(ep.port) +
+  std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: " + ep.host + ":" + std::to_string(ep.port) +
                     "\r\nUser-Agent: builtdiff/" + kToolVersion +
-                    "\r\nContent-Type: application/json\r\nAccept: application/x-ndjson, application/json"
-                    "\r\nConnection: close\r\nContent-Length: " + std::to_string(json_body.size()) + "\r\n\r\n";
-  req += json_body;
+                    "\r\nAccept: application/x-ndjson, application/json\r\nConnection: close\r\n";
+  if (!body.empty())
+    req += "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
+  req += "\r\n";
+  req += body;
   if (!send_all(s.fd, req, total_deadline)) {
     res.error = "failed to send request";
     return res;
@@ -355,6 +361,18 @@ HttpResult http_post_json(const HttpEndpoint& ep, const std::string& path, const
   if (chunked && !dec.done()) { res.ok = false; res.error = "connection closed in the middle of a response"; }
   else if (have_len && !chunked && body_seen < content_len) { res.ok = false; res.error = "connection closed in the middle of a response"; }
   return res;
+}
+
+}  // namespace
+
+HttpResult http_post_json(const HttpEndpoint& ep, const std::string& path, const std::string& json_body,
+                          const std::function<bool(int, std::string_view)>& on_body, const HttpLimits& limits) {
+  return exchange(ep, "POST", path, json_body, on_body, limits);
+}
+
+HttpResult http_get(const HttpEndpoint& ep, const std::string& path,
+                    const std::function<bool(int, std::string_view)>& on_body, const HttpLimits& limits) {
+  return exchange(ep, "GET", path, std::string(), on_body, limits);
 }
 
 }  // namespace bd
