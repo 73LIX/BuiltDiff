@@ -14,7 +14,7 @@ Written in C++20, no third-party libraries (only the standard library and POSIX)
 
 ```bash
 sudo pacman -S --needed base-devel cmake ninja git pkgconf
-git clone <your repo url> builtdiff && cd builtdiff
+git clone https://github.com/73LIX/BuiltDiff.git && cd builtdiff
 cmake -S . -B build -G Ninja && cmake --build build
 ctest --test-dir build            # optional
 sudo cmake --install build        # installs /usr/local/bin/builtdiff
