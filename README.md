@@ -51,12 +51,12 @@ System (OS, arch, distro, libc) -> Toolchain (gcc/clang/cmake/make/ninja/python/
 -> Runtime (ELF `DT_NEEDED`, loader, `GLIBC_x.y` / `GLIBCXX_x.y` symbol versions; read by a bounds-checked parser, `ldd` is never run).
 Missing packages are mapped to `pacman`, `apt` or `dnf` install commands.
 
-## Privacy: what the snapshot contains
+## Privacy: What the snapshot contains
 Tool names + versions, library names + versions, platform, build-file hashes, ELF metadata. It does **not** contain
 user name, home path, hostname, environment variables, IP addresses, SSH keys or any file content. Home path, user and host
 names are redacted from the few strings that could carry them (e.g. compiler banners).
 
-## Security / robustness design
+## Security
 * A `.builtdiff` arrives with a cloned repo, so it is **untrusted**: bounded JSON parser (depth, size, duplicate keys),
   every field validated and sanitized once, control characters stripped before printing, checksum tamper warning.
 * Only an allowlist of tools is ever executed, via `posix_spawn` with an argv vector (no shell), absolute paths,
