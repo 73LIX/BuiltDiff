@@ -31,7 +31,7 @@ void usage(std::ostream& out) {
          "  builtdiff check --analyze      same, plus a plain-language explanation from a local Gemma model\n\n"
          "Options (check):\n"
          "  --analyze           explain the result with a local model (needs Ollama: https://ollama.com)\n"
-         "  --model NAME        model to use (default: $BUILTDIFF_MODEL or " << kDefaultModel << ")\n"
+         "  --model NAME        model to use (default: auto-detected from the local server, or $BUILTDIFF_MODEL)\n"
          "  --host HOST[:PORT]  Ollama server (default: $OLLAMA_HOST or 127.0.0.1:11434)\n"
          "  --allow-remote      allow a non-loopback Ollama server (the report leaves this machine!)\n"
          "  --file PATH         use this snapshot instead of searching for .builtdiff\n"
@@ -158,6 +158,27 @@ int cmd_check(const Args& a) {
       return kExitUsage;
     }
     ao.endpoint.allow_remote = a.allow_remote;
+
+    // Model resolution: explicit flag, then environment, then ask the server
+    // what it has. Only fall back to the built-in default when discovery could
+    // not answer, so a machine with different tags is not stuck.
+    bool explicit_model = !a.model.empty() || std::getenv("BUILTDIFF_MODEL") != nullptr;
+    if (!explicit_model) {
+      std::string derr;
+      ao.available = list_models(ao.endpoint, ao.limits, derr);
+      ao.model = select_model(ao.available, kDefaultModel);
+      if (ao.model.empty()) {
+        ao.model = kDefaultModel;
+        if (!derr.empty())
+          std::cerr << "note: could not list local models (" << sanitize_text(derr, 120)
+                    << ") - trying '" << kDefaultModel << "'\n";
+        else
+          std::cerr << "note: no chat-capable model found on the server - trying '" << kDefaultModel << "'\n";
+      } else if (derr.empty()) {
+        std::cerr << "note: using detected model '" << sanitize_text(ao.model, 64) << "'\n";
+      }
+    }
+
     std::cout << "\n== Explanation (" << sanitize_text(ao.model, 64) << ", running locally) ==\n";
     std::string err;
     if (!analyze_report(rep, ao, std::cout, err))
