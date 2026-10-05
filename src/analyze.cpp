@@ -11,7 +11,91 @@ namespace bd {
 namespace {
 constexpr std::size_t kMaxLine = 1u << 20;
 constexpr std::size_t kMaxAnswer = 64 * 1024;
+constexpr std::size_t kMaxTagsBody = 64 * 1024;
+constexpr std::size_t kMaxModels = 64;
+// Enough for a 4-section answer on a long report. Gemma4 spends this budget on
+// a hidden "thinking" channel too, but requests now set "think": false so all of
+// it goes to the visible reply.
+constexpr int kNumPredict = 1200;
 }  // namespace
+
+bool model_can_chat(const json::Value& entry) {
+  const json::Value* caps = entry.find("capabilities");
+  if (!caps || !caps->is_array()) return false;
+  const json::Value::Array* a = caps->as_array();
+  bool chat = false, embed_only = true;
+  for (const json::Value& c : *a) {
+    const std::string* s = c.as_string();
+    if (!s) continue;
+    if (*s == "completion" || *s == "chat") { chat = true; embed_only = false; }
+    else if (*s != "embedding") { embed_only = false; }
+  }
+  return chat && !embed_only;
+}
+
+std::string select_model(const std::vector<std::string>& installed, const std::string& preferred) {
+  for (const std::string& m : installed)
+    if (m == preferred) return m;
+  for (const std::string& m : installed)
+    if (m.rfind("gemma", 0) == 0) return m;
+  return installed.empty() ? std::string() : installed.front();
+}
+
+std::vector<std::string> list_models(const HttpEndpoint& ep, const HttpLimits& limits, std::string& err) {
+  std::vector<std::string> out;
+  std::string body;
+  body.reserve(8 * 1024);
+  int status = 0;
+  auto res = http_get(
+      ep, "/api/tags",
+      [&](int st, std::string_view chunk) {
+        status = st;
+        if (st == 200 && body.size() < kMaxTagsBody)
+          body.append(chunk.substr(0, kMaxTagsBody - body.size()));
+        return true;
+      },
+      limits);
+  if (!res.ok) {
+    err = res.error;
+    return out;
+  }
+  if (status != 200) {
+    err = "the model server answered HTTP " + std::to_string(status) + " to /api/tags";
+    return out;
+  }
+  // Untrusted input from the network: bounded depth/nodes, and every name is
+  // token-checked before it can be printed or sent back to the server.
+  json::ParseOptions po;
+  po.max_depth = 8;
+  po.max_nodes = 8000;
+  po.max_string = 4096;
+  po.max_members = 256;
+  auto pr = json::parse(body, po);
+  if (!pr.value || !pr.value->is_object()) {
+    err = "could not read the model list from the server";
+    return out;
+  }
+  const json::Value* models = pr.value->find("models");
+  const json::Value::Array* arr = models ? models->as_array() : nullptr;
+  if (!arr) return out;
+  for (const json::Value& e : *arr) {
+    if (out.size() >= kMaxModels) break;
+    if (!e.is_object()) continue;
+    std::string name = json::get_string(e, "name");
+    if (name.empty()) name = json::get_string(e, "model");
+    if (!is_safe_token(name, 96)) continue;
+    if (!model_can_chat(e)) continue;  // embedding-only models cannot answer
+    if (std::find(out.begin(), out.end(), name) == out.end()) out.push_back(std::move(name));
+  }
+  return out;
+}
+
+std::string discover_model(const HttpEndpoint& ep, const HttpLimits& limits, const std::string& preferred,
+                           std::vector<std::string>& installed, std::string& err) {
+  installed = list_models(ep, limits, err);
+  if (installed.empty() && err.empty()) err = "no chat-capable model is installed on the server";
+  return select_model(installed, preferred);
+}
 
 std::string system_prompt() {
   return
@@ -80,7 +164,11 @@ bool NdjsonChat::handle_line(std::string_view line, std::string& text) {
     std::string c = json::get_string(*m, "content");
     text += c;
   }
-  if (json::get_bool(v, "done")) done_ = true;
+  if (json::get_bool(v, "done")) {
+    done_ = true;
+    const json::Value* r = v.find("done_reason");
+    if (r && r->is_string()) done_reason_ = sanitize_text(*r->as_string(), 32);
+  }
   return true;
 }
 
@@ -103,6 +191,10 @@ bool analyze_report(const Report& r, const AnalyzeOptions& opts, std::ostream& o
   json::Value req = json::Value::object();
   req.set("model", opts.model);
   req.set("stream", true);
+  // Gemma4 emits a separate hidden "thinking" channel that num_predict also
+  // counts. Left on, the reasoning ate the whole budget and the visible answer
+  // was truncated mid-sentence. Ask for the answer only.
+  req.set("think", false);
   json::Value msgs = json::Value::array();
   {
     json::Value m = json::Value::object();
@@ -118,7 +210,7 @@ bool analyze_report(const Report& r, const AnalyzeOptions& opts, std::ostream& o
   json::Value o = json::Value::object();
   o.set("temperature", 0.2);
   o.set("num_ctx", 8192);
-  o.set("num_predict", 700);
+  o.set("num_predict", kNumPredict);
   req.set("options", std::move(o));
 
   NdjsonChat nd;
@@ -157,9 +249,24 @@ bool analyze_report(const Report& r, const AnalyzeOptions& opts, std::ostream& o
     std::string msg;
     auto pr = json::parse(err_body);
     if (pr.value && pr.value->is_object()) msg = sanitize_text(json::get_string(*pr.value, "error"), 200);
-    if (res.status == 404)
+    if (res.status == 404) {
       err = "model '" + opts.model + "' is not installed. Run: ollama pull " + opts.model;
-    else
+      // Naming what *is* installed turns this into a one-step fix. Discovery may
+      // not have run yet (explicit --model), so ask now that we know the server
+      // is reachable. Any failure here is ignored; the message above stands.
+      std::vector<std::string> avail = opts.available;
+      if (avail.empty()) {
+        std::string derr;
+        avail = list_models(opts.endpoint, opts.limits, derr);
+      }
+      if (!avail.empty()) {
+        err += ". Installed: ";
+        std::size_t n = std::min<std::size_t>(avail.size(), 8);
+        for (std::size_t i = 0; i < n; ++i) err += (i ? ", " : "") + sanitize_text(avail[i], 64);
+        if (avail.size() > n) err += ", ...";
+        err += " (retry with --model NAME)";
+      }
+    } else
       err = "the model server answered HTTP " + std::to_string(res.status) + (msg.empty() ? "" : ": " + msg);
     return false;
   }
@@ -170,6 +277,11 @@ bool analyze_report(const Report& r, const AnalyzeOptions& opts, std::ostream& o
     else
       err = "the model reported an error: " + e;
     return false;
+  }
+  if (nd.done_reason() == "length") {
+    out << "\n[note: the model stopped at its " << kNumPredict
+        << "-token limit, so this explanation is incomplete. Re-run for a shorter report scope, "
+           "or raise num_predict if you changed it.]\n";
   }
   out << "\n";
   return true;
