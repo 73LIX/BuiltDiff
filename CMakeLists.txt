@@ -15,7 +15,8 @@ find_package(Threads REQUIRED)
 
 add_library(builtdiff_core STATIC
   src/util.cpp src/json.cpp src/proc.cpp src/elf.cpp src/knowledge.cpp src/sysinfo.cpp
-  src/scan.cpp src/snapshot.cpp src/compare.cpp src/http.cpp src/analyze.cpp src/render.cpp)
+  src/scan.cpp src/snapshot.cpp src/compare.cpp src/http.cpp src/analyze.cpp src/render.cpp
+  src/ecosystems.cpp)
 target_include_directories(builtdiff_core PUBLIC src)
 target_link_libraries(builtdiff_core PUBLIC Threads::Threads)
 target_compile_options(builtdiff_core PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wformat=2
