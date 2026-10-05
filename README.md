@@ -25,10 +25,11 @@ Or build a package: `makepkg -si` (uses the included `PKGBUILD`, builds from the
 ```bash
 sudo pacman -S ollama             # or ollama-cuda / ollama-rocm
 sudo systemctl enable --now ollama
-ollama pull gemma3                # any Gemma tag works: gemma3:4b, gemma3:12b ...
+ollama pull gemma4:e2b                # any chat-capable model works: gemma3:4b, gemma4:e2b, llama3.2 ...
 builtdiff check --analyze
 ```
-Override with `--model`, `--host`, `$BUILTDIFF_MODEL`, `$OLLAMA_HOST`. Without Ollama the normal report still prints.
+BuiltDiff asks the server which models it has and picks one itself, so any installed tag works. Override with
+`--model`, `--host`, `$BUILTDIFF_MODEL`, `$OLLAMA_HOST`. Without Ollama the normal report still prints.
 
 ## Usage
 Developer:
