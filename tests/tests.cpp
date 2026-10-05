@@ -65,6 +65,27 @@ static void test_http() {
   ChunkedDecoder bad; std::string o2;
   CHECK(!bad.feed("zz\r\n", o2));
   ChunkedDecoder bad2; CHECK(!bad2.feed("2\r\nabXX", o2));
+
+  // Non-loopback is refused before any bytes are sent, for GET as well as POST.
+  HttpEndpoint pub{"93.184.216.34", 11434, false};
+  HttpResult r = http_get(pub, "/api/tags", [](int, std::string_view) { return true; });
+  CHECK(!r.ok && r.error.find("loopback") != std::string::npos);
+  HttpEndpoint nowhere{"127.0.0.1", 1, false};
+  HttpResult dead = http_get(nowhere, "/api/tags", [](int, std::string_view) { return true; });
+  CHECK(!dead.ok && !dead.error.empty());
+}
+
+// select_model prefers the exact requested tag, then any gemma, then the first
+// chat-capable model; an empty list yields "".
+static void test_select_model() {
+  std::vector<std::string> only_gemma{"gemma4:e2b"};
+  CHECK(select_model(only_gemma, "gemma4:e2b") == "gemma4:e2b");
+  std::vector<std::string> many{"llama3.2:3b", "gemma3:4b", "qwen3:8b"};
+  CHECK(select_model(many, "gemma4:e2b") == "gemma3:4b");   // gemma fallback, not the first
+  CHECK(select_model(many, "qwen3:8b") == "qwen3:8b");      // exact match wins over gemma
+  std::vector<std::string> no_gemma{"llama3.2:3b"};
+  CHECK(select_model(no_gemma, "gemma4:e2b") == "llama3.2:3b");
+  CHECK(select_model({}, "gemma4:e2b").empty());
 }
 
 static void test_ndjson() {
@@ -76,6 +97,19 @@ static void test_ndjson() {
   CHECK(!e.feed("{\"error\":\"model 'x' not found\"}\n", t2) && !e.error().empty());
   NdjsonChat g; CHECK(!g.feed("not json\n", t2));
   NdjsonChat big; CHECK(!big.feed(std::string((1u << 20) + 10, 'a'), t2));
+
+  // Gemma4 streams reasoning in a separate "thinking" field. Only "content" may
+  // reach the terminal, and the reasoning must not count as the answer.
+  NdjsonChat th; std::string t3;
+  CHECK(th.feed("{\"message\":{\"content\":\"\",\"thinking\":\"secret reasoning\"},\"done\":false}\n", t3));
+  CHECK(th.feed("{\"message\":{\"content\":\"visible\"},\"done\":true,\"done_reason\":\"stop\"}\n", t3));
+  CHECK(t3 == "visible" && th.done() && th.done_reason() == "stop");
+
+  // done_reason "length" means the token cap cut the answer off.
+  NdjsonChat cut; std::string t4;
+  CHECK(cut.feed("{\"message\":{\"content\":\"half\"},\"done\":true,\"done_reason\":\"length\"}\n", t4));
+  CHECK(cut.done_reason() == "length");
+  CHECK(cut.error().empty());
 }
 
 static void test_elf_robustness() {
@@ -121,6 +155,7 @@ int main() {
   test_json();
   test_util();
   test_http();
+  test_select_model();
   test_ndjson();
   test_elf_robustness();
   test_scan_and_snapshot();
