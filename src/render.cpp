@@ -1,7 +1,9 @@
 #include "render.hpp"
 
+#include <algorithm>
 #include <ostream>
 #include <set>
+#include <vector>
 
 #include "util.hpp"
 
@@ -75,6 +77,20 @@ void render_report(const Report& r, const RenderOptions& opts, std::ostream& out
     out << r.fails << " failure(s), " << r.warns << " warning(s), " << r.infos << " note(s), " << r.oks << " ok\n";
   }
   if (!r.install_cmd.empty()) out << "\nTo install what is missing:\n  " << r.install_cmd << "\n";
+  // Language packages are deliberately kept out of install_cmd: mixing "sudo
+  // pacman -S libfoo" with "pip install bar" into one line would invite the
+  // reader to run a system command for a package that belongs in the project.
+  // Collect them per ecosystem and show the same set the individual hints use.
+  std::vector<std::string> shown;
+  for (const auto& it : r.items) {
+    if (it.hint_scope != Item::HintScope::Local || it.status == Status::Ok) continue;
+    if (it.hint.empty() || std::find(shown.begin(), shown.end(), it.hint) != shown.end()) continue;
+    shown.push_back(it.hint);
+  }
+  if (!shown.empty()) {
+    out << "\nLanguage packages this project needs:\n";
+    for (const auto& h : shown) out << "  " << h << "\n";
+  }
 }
 
 }  // namespace bd
