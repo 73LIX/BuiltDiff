@@ -59,11 +59,17 @@ bool is_npm_package_name(std::string_view name) noexcept;
 // the charset check; npm additionally needs the '@' + '/' scoped form.
 bool is_eco_package_name(Eco e, std::string_view name) noexcept;
 
+// A maven coordinate is "<groupId>:<artifactId>". Both halves are validated with
+// is_eco_package_name; exactly one colon is required. Validate the whole string
+// through this rather than the plain predicate, which expects a bare group.
+bool is_maven_coordinate(std::string_view name) noexcept;
+
 // ------------------------------------------------------------- specifiers
 
 enum class Verdict {
   Ok,      // version satisfies the constraint
-  TooOld,  // version is below the constraint
+  TooOld,  // version is below a lower bound the project asked for
+  TooNew,  // version is above an upper bound: newer than the project pins
   Unknown, // constraint cannot be evaluated - never reported as a failure
 };
 
@@ -107,6 +113,19 @@ struct InstalledPkg {
   std::string name;
   std::string version;
 };
+
+// Result of looking for one installed package. Mirrors the shape of the native
+// LibProbe so both kinds of dependency can flow through one comparison loop.
+struct EcoProbe {
+  bool found = false;
+  std::string version;
+  std::string via;  // site-packages | node_modules | cargo | go | .m2
+};
+
+// Locates `name` within the given ecosystem and reports what it found.
+// `found` is only true when a real version was read: an ecosystem we could not
+// search is reported as not found rather than optimistically satisfied.
+EcoProbe probe_eco_package(Eco eco, std::string_view name, const std::string& project_root);
 
 // python3.14 site-packages dirs, active venv first (VIRTUAL_ENV, then ./.venv,
 // ./venv, ./env - each confirmed by a pyvenv.cfg), then the system
