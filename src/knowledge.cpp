@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 
 #include "util.hpp"
+
+namespace fs = std::filesystem;
 
 namespace bd {
 
@@ -370,6 +373,79 @@ std::optional<StdRequirement> cxx_std_requirement(std::string_view n) noexcept {
   if (n == "23") return StdRequirement{13, 17};
   if (n == "26" || n == "2c") return StdRequirement{14, 19};
   return std::nullopt;
+}
+
+// ------------------------------------------------------- language packages
+
+bool project_has_venv(const std::string& root) {
+  if (root.empty()) return false;
+  std::error_code ec;
+  for (const char* rel : {".venv", "venv", "env"}) {
+    if (fs::exists(root + "/" + rel + "/pyvenv.cfg", ec)) return true;
+  }
+  return false;
+}
+
+std::string eco_install_command(Eco eco, const std::vector<std::string>& names, const std::string& project_root) {
+  if (names.empty()) return {};
+  // Re-validate every name. These strings came out of a snapshot file, which is
+  // untrusted input: the command below is only ever printed, but a name with a
+  // space or a quote would still make the printed line wrong and misleading.
+  std::string list;
+  for (const auto& n : names) {
+    const bool ok = (eco == Eco::Maven) ? is_maven_coordinate(n) : is_eco_package_name(eco, n);
+    if (!ok) continue;
+    if (!list.empty()) list += " ";
+    list += sanitize_text(n, 64);
+  }
+  if (list.empty()) return {};
+
+  // Prefer the project's own virtualenv when it has one: the developer activated
+  // it, so that is where the package belongs. An activated VIRTUAL_ENV that is
+  // not in the project is left alone - we must not guess at paths outside it.
+  const bool venv = project_has_venv(project_root);
+  switch (eco) {
+    case Eco::Pip:
+      return (venv ? "pip install " : "python3 -m pip install ") + list;
+    case Eco::Npm:
+      return "npm install " + list;
+    case Eco::Cargo:
+      return "cargo add " + list;  // note: writes Cargo.toml; see the hint text
+    case Eco::Maven:
+      return "mvn dependency:get -Dartifact=" + list;
+    case Eco::Go:
+      return "go get " + list;
+    case Eco::Native:
+      break;
+  }
+  return {};
+}
+
+std::string eco_install_hint(Eco eco, std::string_view name, const std::string& project_root) {
+  const std::string pkg(name);
+  const bool ok = (eco == Eco::Maven) ? is_maven_coordinate(pkg) : is_eco_package_name(eco, pkg);
+  if (!ok) return {};
+  // The pinned version is what the developer actually used, so suggest exactly
+  // that rather than the range: it is reproducible and it always exists.
+  const std::string cmd = eco_install_command(eco, {pkg}, project_root);
+  if (cmd.empty()) return {};
+  switch (eco) {
+    case Eco::Cargo:
+      return cmd + "   (edits Cargo.toml; use --version to pick a version)";
+    case Eco::Maven:
+      return cmd + "   (downloads into ~/.m2; most projects should add it to pom.xml instead)";
+    case Eco::Go:
+      return cmd + "   (adds it to go.mod)";
+    case Eco::Pip:
+      if (project_has_venv(project_root))
+        return cmd + "   (installs into this project's .venv)";
+      return cmd + "   (system-wide; prefer python3 -m venv .venv if this project has none)";
+    case Eco::Npm:
+      return cmd + "   (adds it to package.json)";
+    case Eco::Native:
+      break;
+  }
+  return cmd;
 }
 
 }  // namespace bd
