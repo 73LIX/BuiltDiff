@@ -370,6 +370,10 @@ void scan_pom(const std::string& text, ScanResult& r) {
   merge_specs(r.packages, parse_pom_deps(text));
 }
 
+void scan_gradle(const std::string& text, ScanResult& r) {
+  merge_specs(r.packages, parse_gradle_deps(text));
+}
+
 void scan_go_mod(const std::string& text, ScanResult& r) {
   for (const auto& raw : split(text, '\n')) {
     std::string_view line = trim(raw);
@@ -437,8 +441,8 @@ ScanResult scan_project(const std::string& root) {
       {"Cargo.toml", "cargo", scan_cargo},
       {"package.json", "npm", scan_package_json},
       {"pom.xml", "maven", scan_pom},
-      {"build.gradle", "gradle", nullptr},
-      {"build.gradle.kts", "gradle", nullptr},
+      {"build.gradle", "gradle", scan_gradle},
+      {"build.gradle.kts", "gradle", scan_gradle},
       {"go.mod", "go", scan_go_mod},
       {"go.sum", "go", nullptr},
       {"pyproject.toml", "python", scan_pyproject},
@@ -472,28 +476,15 @@ ScanResult scan_project(const std::string& root) {
     merge_specs(r.packages, pinned);
   }
   if (auto sum = read_file_under(root, "go.sum", kMaxBuildFile)) {
-    // go.sum lists a module once per dependency edge plus its /go.mod hash.
-    // probe_go_version already reads it for versions; here we only use it to
-    // pin declared modules, so take the highest version per module path.
-    std::map<std::string, std::string> best;
-    for (const auto& raw : split(*sum, '\n')) {
-      const std::string_view line = trim(raw);
-      const std::size_t sp = line.find(' ');
-      if (sp == std::string_view::npos) continue;
-      const std::string mod = sanitize_text(line.substr(0, sp), 128);
-      std::string_view ver = trim(line.substr(sp + 1));
-      const std::size_t sp2 = ver.find(' ');
-      if (sp2 != std::string_view::npos) ver = ver.substr(0, sp2);
-      const std::string vs = sanitize_text(ver, 48);
-      if (mod.empty() || vs.empty()) continue;
-      auto it = best.find(mod);
-      if (it == best.end() || it->second < vs) best[mod] = vs;
-    }
-    std::vector<PkgSpec> pinned;
+    // go.sum lists a module once per dependency edge plus its /go.mod hash,
+    // and often holds several versions of one module. parse_go_sum() collapses
+    // that to module -> highest version and matches the module path exactly, so
+    // this no longer has to guess which line belongs to which dependency.
+    const std::map<std::string, std::string> pinned_by_mod = parse_go_sum(*sum);
     for (auto& d : r.packages) {
       if (d.kind != "go") continue;
-      const auto it = best.find(d.name);
-      if (it == best.end()) continue;
+      const auto it = pinned_by_mod.find(d.name);
+      if (it == pinned_by_mod.end()) continue;
       d.version_locked = it->second;
     }
   }
