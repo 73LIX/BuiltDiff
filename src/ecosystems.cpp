@@ -101,16 +101,51 @@ bool is_eco_package_name(Eco e, std::string_view name) noexcept {
         if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '.' || c == '_' || c == '-')) return false;
       return name.front() != '-' && name.back() != '.';
     }
-    default: break;
+    // "Native" is not a package manager, so this predicate is meaningless for
+    // it. Native libraries are validated by is_safe_token instead. Answering
+    // true here would let a caller mistake "any string" for "a safe package
+    // name" - which is exactly the confusion that produced a path traversal.
+    case Eco::Native: return false;
+    case Eco::Cargo: {
+      // Crates.io names are a single path segment: [A-Za-z0-9_-] with a leading
+      // '_' or alphanumeric. No '/' and no '.' at all, so "../evil" and "a/b"
+      // can never reach a filesystem path built from this.
+      if (name.empty() || name.size() > 64) return false;
+      const char c0 = name.front();
+      if (!(std::isalnum(static_cast<unsigned char>(c0)) != 0 || c0 == '_')) return false;
+      for (char c : name)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '-')) return false;
+      return true;
+    }
+    case Eco::Go:
+      break;
   }
-  // Cargo crates and Go modules: allow a leading 'v' for go, plus + in crates.
-  if (name.empty() || name.size() > 128 || name.front() == '-') return false;
-  for (char c : name) {
-    const bool ok = std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '.' || c == '_' || c == '-' ||
-                    c == '+' || c == '/';
-    if (!ok) return false;
+  // Go module paths legitimately contain '/', so the path-shaped names have to
+  // be checked rather than the charset alone: no leading '/', no empty
+  // component, and no "." or ".." component that could escape a cache root.
+  if (name.empty() || name.size() > 128) return false;
+  for (char c : name)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '.' || c == '_' || c == '-' ||
+          c == '+' || c == '/' || c == '~'))
+      return false;
+  if (name.front() == '/' || name.back() == '/') return false;
+  std::size_t start = 0;
+  while (start <= name.size()) {
+    const std::size_t slash = name.find('/', start);
+    const std::string_view comp = name.substr(start, slash == std::string_view::npos ? std::string_view::npos : slash - start);
+    if (comp.empty() || comp == "." || comp == "..") return false;
+    if (slash == std::string_view::npos) break;
+    start = slash + 1;
   }
   return true;
+}
+
+bool is_maven_coordinate(std::string_view name) noexcept {
+  const std::size_t colon = name.find(':');
+  if (colon == std::string_view::npos || colon == 0 || colon + 1 >= name.size()) return false;
+  if (name.find(':', colon + 1) != std::string_view::npos) return false;
+  return is_eco_package_name(Eco::Maven, name.substr(0, colon)) &&
+         is_eco_package_name(Eco::Maven, name.substr(colon + 1));
 }
 
 // ------------------------------------------------------------- specifiers
@@ -190,14 +225,14 @@ std::pair<Bound, Bound> caret_range(Version v) {
     if (v.parts[i] != 0) { first_diff = i; break; }
   if (first_diff == v.parts.size()) first_diff = v.parts.size() == 1 ? 0 : 1;
   if (major != 0) {
+    // ^1.2.3 -> >=1.2.3 <2
     hi.ver.parts.clear();
     hi.ver.parts.push_back(major + 1);
-  } else if (first_diff + 1 < v.parts.size()) {
+  } else {
+    // A leading 0 pins that component, so the bump happens at the first
+    // non-zero one: ^0.5 -> <0.6, ^0.0.3 -> <0.0.4, ^0 -> <1.
     hi.ver.parts.resize(first_diff + 1);
     hi.ver.parts[first_diff] = v.parts[first_diff] + 1;
-  } else {
-    hi.ver.parts = v.parts;
-    hi.ver.parts.push_back(1);
   }
   return {lo, hi};
 }
@@ -239,13 +274,19 @@ std::pair<Bound, Bound> wildcard_range(std::string_view s) {
 
 struct Range {
   std::vector<Bound> bounds;  // all must hold
-  bool unbounded = true;      // true => no constraint we understand
+  bool unbounded = true;      // true => no constraint at all (empty spec, "*")
+  bool unreadable = false;    // true => a constraint was given but not understood
 };
 
 Range parse_range(Eco e, std::string_view spec) {
   Range r;
   std::string_view s = trim(spec);
   if (s.empty() || s == "*" || iequals(s, "latest") || s == "x" || s == "X") return r;
+  // From here on a constraint exists. If we end up with no usable bounds the
+  // answer is Unknown, not Ok: a git URL or a workspace protocol is not a
+  // version range, and silently treating it as unconstrained would report a
+  // dependency as satisfied when we never actually checked it.
+  r.unbounded = false;
 
   if (e == Eco::Maven && (s.front() == '[' || s.front() == '(')) {  // [1.0,2.0)
     const bool inc_lo = s.front() == '[';
@@ -260,7 +301,7 @@ Range parse_range(Eco e, std::string_view spec) {
       if (!hi.empty() && (hi.back() == ']' || hi.back() == ')')) hi.pop_back();
       if (auto v = parse_pkg_version(hi); v && !v->empty()) r.bounds.push_back({inc_hi ? 'l' : '<', *v});
     }
-  } else if (e == Eco::Npm && (s.front() == '^' || s.front() == '~')) {
+  } else if ((e == Eco::Npm || e == Eco::Cargo) && (s.front() == '^' || s.front() == '~')) {
     const char opc = s.front();
     const std::string_view rest = trim(s.substr(1));
     std::size_t given = 0;
@@ -272,7 +313,7 @@ Range parse_range(Eco e, std::string_view spec) {
       r.bounds.push_back(pr.first);
       r.bounds.push_back(pr.second);
     }
-  } else if (e == Eco::Npm && s.find_first_of("xX*") != std::string_view::npos) {
+  } else if ((e == Eco::Npm || e == Eco::Cargo) && s.find_first_of("xX*") != std::string_view::npos) {
     const auto pr = wildcard_range(s);
     r.bounds = pr.first.ver.parts.empty() && pr.second.ver.parts.empty() ? std::vector<Bound>{} : std::vector<Bound>{pr.first, pr.second};
   } else if (e == Eco::Pip && (s.rfind("~=", 0) == 0 || s.rfind("==", 0) == 0) && s.find(',') == std::string_view::npos) {
@@ -314,7 +355,10 @@ Range parse_range(Eco e, std::string_view spec) {
       if (auto v = parse_pkg_version(rest); v && !v->empty()) r.bounds.push_back({op, *v});
     }
   }
-  r.unbounded = r.bounds.empty();
+  if (r.bounds.empty()) {
+    r.unbounded = false;
+    r.unreadable = true;
+  }
   return r;
 }
 
@@ -326,17 +370,26 @@ Verdict check_spec(Eco e, std::string_view version, std::string_view spec) {
   const auto have = parse_pkg_version(vs);
   if (!have || have->empty()) return Verdict::Unknown;
   const Range r = parse_range(e, spec);
-  if (r.unbounded) return Verdict::Ok;  // unconstrained or unreadable => not a failure
+  if (r.unreadable) return Verdict::Unknown;
+  if (r.unbounded) return Verdict::Ok;  // genuinely unconstrained => not a failure
   bool all = true;
   for (const auto& b : r.bounds)
     if (!cmp_bound(*have, b)) all = false;
   if (all) return Verdict::Ok;
-  // TooOld only when a lower bound is what failed. Sitting above an upper bound
-  // means the environment is *newer* than the project pins, which is not the
-  // same problem and must not be reported as one.
-  for (const auto& b : r.bounds)
-    if (!cmp_bound(*have, b) && !bound_is_lower(b)) return Verdict::Unknown;
-  return Verdict::TooOld;
+  // A bound that failed decides the message. Below a floor is TooOld; above a
+  // ceiling is TooNew. These are genuinely different problems - "you need to
+  // upgrade" versus "you have something the project did not ask for" - so they
+  // must not be collapsed into one verdict, and neither may be reported as Ok.
+  for (const auto& b : r.bounds) {
+    if (cmp_bound(*have, b)) continue;
+    // '=' is exact equality, which is neither a floor nor a ceiling, so the
+    // direction has to come from the comparison itself. Without this a pinned
+    // version that is simply older ("31.0.0" against "==33.0.0") was reported as
+    // "newer than the project allows" - the opposite of the truth.
+    if (b.op == '=') return compare_versions(*have, b.ver) < 0 ? Verdict::TooOld : Verdict::TooNew;
+    return bound_is_lower(b) ? Verdict::TooOld : Verdict::TooNew;
+  }
+  return Verdict::Ok;
 }
 
 std::string spec_min(Eco e, std::string_view spec) {
@@ -764,6 +817,14 @@ std::vector<PkgSpec> parse_go_mod_requires(std::string_view text) {
     s.kind = "go";
     s.spec = sanitize_text(ver, 48);
     s.required_min = spec_min(Eco::Go, s.spec);
+    // A go.mod "require" is an exact pin, exactly like a lock file: there is no
+    // range operator in that grammar. Recording it as version_locked lets `check`
+    // say "you have v1.2.0, the project pins v1.9.1" instead of only complaining
+    // that v1.2.0 is too old, and makes it correct when a newer module is present.
+    if (!s.spec.empty() && s.spec.find_first_of("^~<>=*x") == std::string::npos) {
+      s.version_locked = s.spec;
+      if (s.required_min.empty()) s.required_min = s.spec;
+    }
     push(out, std::move(s));
   }
   return out;
@@ -894,39 +955,55 @@ std::string version_from_dist_info(const std::string& dir_path, const std::strin
 
 }  // namespace
 
+// A venv created with `include-system-site-packages = false` (the default) does
+// NOT see the interpreter's own site-packages. Searching those anyway would
+// report a dependency as installed when the project's environment cannot
+// actually import it - the single most damaging wrong answer this layer could
+// give, because it hides a real "pip install" the user still has to do.
+bool venv_sees_system_site_packages(const std::string& venv_root) {
+  auto cfg = read_registry_file(venv_root + "/pyvenv.cfg");
+  if (!cfg) return false;
+  for (const auto& raw : split(*cfg, '\n')) {
+    const std::string_view line = trim(raw);
+    if (line.rfind("include-system-site-packages", 0) != 0) continue;
+    const auto eq = line.find('=');
+    if (eq == std::string_view::npos) continue;
+    const std::string_view v = trim(line.substr(eq + 1));
+    return iequals(v, "true") || v == "1";
+  }
+  return false;  // absent means false, per the venv spec
+}
+
 std::vector<std::string> pip_search_dirs(const std::string& project_root) {
   std::vector<std::string> out;
-  // An active virtualenv first: that is the environment the user will actually
-  // run the program in, and it is the whole reason this layer exists.
-  if (const char* ve = std::getenv("VIRTUAL_ENV"); ve && *ve == '/' && std::string(ve).size() < 400) {
+  // Found a virtualenv that deliberately hides the system packages. Stop here:
+  // the answer must describe that environment, not the one behind it.
+  bool isolated_venv = false;
+  auto add_venv = [&](const std::string& vroot) {
     std::error_code ec;
-    if (fs::exists(std::string(ve) + "/pyvenv.cfg", ec)) {
-      // pyvenv.cfg points at lib/pythonX.Y/site-packages relative to the root.
-      for (const char* d : {"lib"}) {
-        std::error_code ec2;
-        for (fs::directory_iterator it(std::string(ve) + "/" + d, ec2), end; !ec2 && it != end; it.increment(ec2)) {
-          const std::string sub = it->path().string() + "/site-packages";
-          std::error_code ec3;
-          if (fs::is_directory(sub, ec3)) add_dir(out, sub, "venv");
-        }
-      }
-    }
-  }
-  // Then a venv in the project itself, which is the common "clone and forget"
-  // case: the user never activated anything, but .venv/ is right there.
-  for (const char* rel : {".venv", "venv", "env", ".env"}) {
-    if (project_root.empty()) break;
-    const std::string vroot = project_root + "/" + rel;
-    std::error_code ec;
-    if (!fs::exists(vroot + "/pyvenv.cfg", ec)) continue;
+    if (!fs::exists(vroot + "/pyvenv.cfg", ec)) return;
     std::error_code ec2;
     for (fs::directory_iterator it(vroot + "/lib", ec2), end; !ec2 && it != end; it.increment(ec2)) {
       const std::string sub = it->path().string() + "/site-packages";
       std::error_code ec3;
-      if (fs::is_directory(sub, ec3)) add_dir(out, sub, "project venv");
+      if (fs::is_directory(sub, ec3)) add_dir(out, sub, "venv");
     }
+    if (!venv_sees_system_site_packages(vroot)) isolated_venv = true;
+  };
+  // An active virtualenv first: that is the environment the user will actually
+  // run the program in, and it is the whole reason this layer exists.
+  if (const char* ve = std::getenv("VIRTUAL_ENV"); ve && *ve == '/' && std::string(ve).size() < 400)
+    add_venv(ve);
+  // Then a venv in the project itself, which is the common "clone and forget"
+  // case: the user never activated anything, but .venv/ is right there.
+  for (const char* rel : {".venv", "venv", "env", ".env"}) {
+    if (project_root.empty()) break;
+    add_venv(project_root + "/" + rel);
   }
-  // Finally the interpreters installed system-wide.
+  if (isolated_venv) return out;
+  // Finally the interpreters installed system-wide. Only reachable when no
+  // isolated virtualenv applies, so a system copy cannot mask a venv that is
+  // missing the package.
   std::error_code ec;
   for (fs::directory_iterator it("/usr/lib", ec), end; !ec && it != end; it.increment(ec)) {
     const std::string fn = it->path().filename().string();
@@ -1085,6 +1162,46 @@ std::string probe_go_version(std::string_view name, const std::string& project_r
     }
   }
   return best;
+}
+
+EcoProbe probe_eco_package(Eco eco, std::string_view name, const std::string& project_root) {
+  EcoProbe p;
+  switch (eco) {
+    case Eco::Pip:
+      p.version = probe_pip_version(name, project_root);
+      p.via = "site-packages";
+      break;
+    case Eco::Npm:
+      p.version = probe_npm_version(name, project_root);
+      p.via = "node_modules";
+      break;
+    case Eco::Cargo:
+      p.version = probe_cargo_version(name, project_root);
+      p.via = "cargo";
+      break;
+    case Eco::Go:
+      p.version = probe_go_version(name, project_root);
+      p.via = "go";
+      break;
+    case Eco::Maven: {
+      p.via = ".m2";
+      const std::size_t colon = name.find(':');
+      if (colon == std::string_view::npos) return p;
+      const char* home = std::getenv("HOME");
+      // An absolute $HOME is required: the .m2 path is built by concatenation,
+      // and a relative or empty HOME would produce a path under the CWD.
+      if (!home || *home != '/' || std::string(home).size() > 400) return p;
+      p.version = probe_maven_version(name.substr(0, colon), name.substr(colon + 1), home);
+      break;
+    }
+    case Eco::Native:
+      return p;
+  }
+  p.version = sanitize_text(p.version, 48);
+  // Only claim found when a real version was read. A package we could not look
+  // up must read as missing, never as satisfied.
+  p.found = !p.version.empty();
+  return p;
 }
 
 std::string probe_maven_version(std::string_view group, std::string_view artifact, const std::string& home) {
