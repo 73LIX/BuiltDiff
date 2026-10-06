@@ -136,8 +136,11 @@ int cmd_check(const Args& a) {
     std::cerr << "error: " << lr.error << "\n";
     return kExitError;
   }
-  std::string root = fs::path(path).parent_path().string();
-  if (root.empty()) root = ".";
+  // The project root is where we are running, not where the snapshot file sits.
+  // A committed .builtdiff usually arrives from another machine (or a container
+  // mount), so probing its parent directory would inspect the *developer's*
+  // venv and report a false match.
+  const std::string root = cwd_string();
   Report rep = compare_snapshot(*lr.snap, root);
 
   if (a.json) {
