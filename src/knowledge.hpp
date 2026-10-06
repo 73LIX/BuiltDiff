@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "ecosystems.hpp"
 #include "model.hpp"
 
 namespace bd {
@@ -44,5 +45,18 @@ std::string find_owner_hint(PkgMgr m, std::string_view soname);
 // ---- language standard heuristics (practical minimum compiler majors)
 struct StdRequirement { int gcc; int clang; };
 std::optional<StdRequirement> cxx_std_requirement(std::string_view std_number) noexcept;
+
+// ---- language packages
+// The command that installs `name` for this ecosystem. Built from a fixed
+// template plus a name that already passed is_eco_package_name, so there is no
+// injection surface here; the caller still renders it as text, never executes
+// it. `spec` is appended only when it is a plain version, since
+// "pip install x>=1,<2" is not valid shell for every package manager.
+// A venv is preferred over the system interpreter when the project has one, so
+// the suggested command lands in the same environment the project uses.
+std::string eco_install_hint(Eco eco, std::string_view name, const std::string& project_root);
+std::string eco_install_command(Eco eco, const std::vector<std::string>& names, const std::string& project_root);
+// True when the project has a .venv / venv / env, i.e. the hint should use it.
+bool project_has_venv(const std::string& project_root);
 
 }  // namespace bd
