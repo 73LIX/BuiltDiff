@@ -15,6 +15,7 @@
 //     than an admitted gap.
 #pragma once
 
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -82,6 +83,12 @@ Verdict check_spec(Eco e, std::string_view version, std::string_view spec);
 // ">=5.9,<7" -> "5.9"; "^1.2.3" -> "1.2.3"; "*" -> "";
 std::string spec_min(Eco e, std::string_view spec);
 
+// Do these two version strings denote the same release? Compared as versions,
+// not as text, so "v1.9.1" and "1.9.1" match. Falls back to a plain string
+// comparison when either side cannot be parsed, because two unparseable strings
+// that are byte-identical really are the same thing.
+bool versions_match(std::string_view a, std::string_view b);
+
 // --------------------------------------------------------------- parsers
 // All are pure functions over file text. They skip comments and unresolvable
 // entries rather than guessing.
@@ -94,6 +101,20 @@ std::vector<PkgSpec> parse_cargo_deps(std::string_view text);
 // name -> resolved version, from [[package]] blocks of a Cargo.lock.
 std::vector<PkgSpec> parse_cargo_lock(std::string_view text);
 std::vector<PkgSpec> parse_go_mod_requires(std::string_view text);
+// go.sum lines are "<module> <version> <hash>", and every version appears
+// twice (once for the module, once for its /go.mod). Collapses that to
+// module -> highest version, keeping the "v" prefix the file uses.
+//
+// Module paths are matched EXACTLY. A prefix match would let "github.com/x/y"
+// pick up a line belonging to "github.com/x/yz" and report another module's
+// version as installed, so the name is compared whole.
+std::map<std::string, std::string> parse_go_sum(std::string_view text);
+// "g:a" / "g:a:v" coordinates from build.gradle / build.gradle.kts DSL lines.
+// Only dependency-configuration lines are read, never plugin id or version
+// catalog lines, and only literal or range versions count as satisfiable; a
+// version the file computes elsewhere (BOM, catalog, variable) is recorded
+// as unverifiable rather than guessed.
+std::vector<PkgSpec> parse_gradle_deps(std::string_view text);
 std::vector<PkgSpec> parse_pom_deps(std::string_view text);
 
 // Appends `specs` to `out`, deduplicating by canonical name and keeping the

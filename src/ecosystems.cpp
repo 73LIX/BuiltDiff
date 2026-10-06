@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <ranges>
 
 #include "json.hpp"
 #include "util.hpp"
@@ -406,6 +408,15 @@ std::string spec_min(Eco e, std::string_view spec) {
   return found ? version_string(best) : std::string();
 }
 
+bool versions_match(std::string_view a, std::string_view b) {
+  const std::string_view sa = trim(a), sb = trim(b);
+  if (sa == sb) return true;
+  const auto va = parse_pkg_version(sa);
+  const auto vb = parse_pkg_version(sb);
+  if (!va || !vb || va->empty() || vb->empty()) return false;
+  return compare_versions(*va, *vb) == 0;
+}
+
 // ---------------------------------------------------------------- parsers
 
 namespace {
@@ -629,18 +640,30 @@ std::vector<PkgSpec> parse_setup_py_deps(std::string_view text) {
   std::vector<PkgSpec> out;
   static const char* const keys[] = {"install_requires", "setup_requires", "tests_require"};
   for (const char* key : keys) {
-    const std::string needle = std::string(key) + "=";
+    // Find the bare key, then walk to the '=' separately. Searching for
+    // "install_requires=" would miss "install_requires = [", and PEP 8 (and
+    // black, and every linter) requires that space around a keyword
+    // argument's '=' - so the un-spaced form was the rare one, and searching
+    // for it made the whole parser miss real projects.
+    const std::string_view keysv(key);
     std::size_t pos = 0;
-    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
-      // Require a non-identifier character in front, so "requires=" inside
-      // "setup_requires=" is not matched twice.
+    while ((pos = text.find(keysv, pos)) != std::string_view::npos) {
+      const std::size_t after = pos + keysv.size();
+      // Require a non-identifier character in front, so "requires" does not
+      // match inside "setup_requires".
       if (pos > 0) {
         const char prev = text[pos - 1];
         const bool ident = (prev == '_' || (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
                             (prev >= '0' && prev <= '9'));
-        if (ident) { pos += needle.size(); continue; }
+        if (ident) { pos = after; continue; }
       }
-      pos += needle.size();
+      // ...and an '=' after any spaces/tabs (not newlines: a line break before
+      // the '=' is legal Python but far too rare to be worth the risk of
+      // wandering into unrelated code).
+      std::size_t eq = after;
+      while (eq < text.size() && (text[eq] == ' ' || text[eq] == '\t')) ++eq;
+      if (eq >= text.size() || text[eq] != '=') { pos = after; continue; }
+      pos = eq + 1;
       // Skip whitespace, including the newline before a wrapped list.
       std::size_t open = pos;
       while (open < text.size() && (text[open] == ' ' || text[open] == '\t' || text[open] == '\n' ||
@@ -826,6 +849,160 @@ std::vector<PkgSpec> parse_go_mod_requires(std::string_view text) {
       if (s.required_min.empty()) s.required_min = s.spec;
     }
     push(out, std::move(s));
+  }
+  return out;
+}
+
+std::map<std::string, std::string> parse_go_sum(std::string_view text) {
+  std::map<std::string, std::string> out;
+  for (const auto& raw : split(text, '\n')) {
+    const std::string_view line = trim(raw);
+    if (line.empty()) continue;
+    const std::size_t sp = line.find(' ');
+    if (sp == std::string_view::npos) continue;
+    // The module path is the whole first field. Never prefix-match it: "y"
+    // must not pick up the line written for "yz".
+    const std::string mod = sanitize_text(line.substr(0, sp), 128);
+    if (mod.empty() || !is_eco_package_name(Eco::Go, mod)) continue;
+    std::string_view ver = trim(line.substr(sp + 1));
+    const std::size_t sp2 = ver.find(' ');
+    if (sp2 != std::string_view::npos) ver = trim(ver.substr(0, sp2));
+    const std::string vs = sanitize_text(ver, 48);
+    if (vs.empty()) continue;
+    const auto cur = out.find(mod);
+    if (cur == out.end()) {
+      out.emplace(mod, vs);
+      continue;
+    }
+    // Compare as versions, not as text. go.sum routinely holds several
+    // versions of one module, and a text comparison ranks "v1.9.1" above
+    // "v1.10.0" because "9" sorts after "1".
+    const auto a = parse_pkg_version(cur->second), b = parse_pkg_version(vs);
+    if (!a || !b || compare_versions(*b, *a) > 0) cur->second = vs;
+  }
+  return out;
+}
+
+std::vector<PkgSpec> parse_gradle_deps(std::string_view text) {
+  // Can check_spec() actually evaluate this `spec`? A literal or a Maven range
+  // yes; "1.+", a catalog symbol or an empty version no, and those must be
+  // reported as unverifiable rather than silently satisfied.
+  auto version_testable = [](std::string_view spec) {
+    if (spec.empty()) return false;
+    // Maven dynamic forms are not a satisfiable constraint even though the
+    // tolerant version parser accepts them: "1.+", "1.2.x" are "any recent",
+    // not a floor we can test. A bracketed range like "[1.0,2.0)" is exact and
+    // fine.
+    if (spec.find('+') != std::string_view::npos) return false;
+    if (spec.find('*') != std::string_view::npos || spec.find('x') != std::string_view::npos) return false;
+    if (spec.front() == '[') return true;
+    const auto v = parse_pkg_version(spec);
+    return v && !v->empty();
+  };
+  // Configuration names that introduce a dependency line in the Groovy and
+  // Kotlin DSLs. A project that only ever uses a custom configuration spelling
+  // is missed, which is the safe direction: we report nothing rather than
+  // guessing which quoted string on an unrelated line is a dependency.
+  static const char* const configs[] = {
+      "api", "compile", "compileOnly", "compileOnlyApi", "implementation", "providedCompile", "providedRuntime",
+      "runtimeOnly", "annotationProcessor", "kapt", "ksp",
+      "testApi", "testCompile", "testCompileOnly", "testImplementation", "testRuntimeOnly", "testAnnotationProcessor",
+      "androidTestApi", "androidTestCompileOnly", "androidTestImplementation", "androidTestRuntimeOnly",
+      "debugApi", "debugImplementation", "debugRuntimeOnly", "releaseApi", "releaseImplementation", "releaseRuntimeOnly",
+  };
+  // Version tails can be literal, Maven range ("[1.0,2.0)"), dynamic ("1.+") or
+  // a bare project property. Only the first two are testable, so the caller
+  // marks the rest unverifiable.
+  auto version_spec = [](std::string_view v) -> std::string {
+    const auto s = sanitize_text(trim(v), 48);
+    if (s.empty()) return {};
+    if (s.find("${") != std::string::npos) return {};
+    return s;
+  };
+
+  std::vector<PkgSpec> out;
+  for (const auto& raw : split(text, '\n') | std::views::transform(trim)) {
+    std::string_view line = raw;
+    if (line.empty()) continue;
+    if (line[0] == '#' || line.rfind("//", 0) == 0 || line.rfind("/*", 0) == 0) continue;
+    // The line must start with a known configuration name.
+    const std::size_t head = line.find_first_of(" (");
+    const std::string_view fn = line.substr(0, head == std::string_view::npos ? line.size() : head);
+    const bool is_config = std::any_of(std::begin(configs), std::end(configs),
+                                       [&](const char* c) { return fn == c; });
+    if (!is_config) continue;
+
+    // Map form: "implementation group: 'g', name: 'a', version: 'v'" (Groovy)
+    // or "implementation(group = "g", name = "a", version = "v")" (Kotlin).
+    auto value_of = [&](const char* key) -> std::string {
+      std::size_t pos = 0;
+      while ((pos = line.find(key, pos)) != std::string_view::npos) {
+        char after = pos + std::strlen(key) < line.size() ? line[pos + std::strlen(key)] : ' ';
+        const bool delim = (after == ':' || after == '=' || after == ' ');
+        if (!delim) { pos += std::strlen(key); continue; }
+        std::size_t v = pos + std::strlen(key);
+        while (v < line.size() && (line[v] == ' ' || line[v] == '\t' || line[v] == ':' || line[v] == '=')) ++v;
+        if (v < line.size() && (line[v] == '\'' || line[v] == '"')) {
+          const char q = line[v++];
+          const auto e = line.find(q, v);
+          if (e != std::string_view::npos) return sanitize_text(line.substr(v, e - v), 64);
+        }
+        pos = v;
+      }
+      return {};
+    };
+    const std::string mg = value_of("group");
+    const std::string mn = value_of("name");
+    if (!mn.empty()) {
+      const std::string mv = value_of("version");
+      PkgSpec s;
+      s.kind = "maven";
+      s.name = mg.empty() ? mn : mg + ":" + mn;
+      if (is_maven_coordinate(s.name) && s.name != mn) {  // external deps carry a group
+        s.spec = version_spec(mv);
+        s.unverifiable = !version_testable(s.spec);
+        // Only a literal/range version supports a floor. A dynamic "1.+" must
+        // not claim ">= 1" as its requirement.
+        if (!s.unverifiable) s.required_min = spec_min(Eco::Maven, s.spec);
+        if (!s.required_min.empty() || s.unverifiable) push(out, std::move(s));
+      }
+      continue;  // a map form is one dependency; do not also scan quoted strings
+    }
+
+    // Coordinate string form: "implementation 'g:a:v'", with or without parens.
+    // A quoted string that is not a bare group or bare version has one colon at
+    // most, so plugin ids ("org.foo.bar") and version literals ("1.2.3") cannot
+    // be mistaken for coordinates.
+    std::size_t pos = 0;
+    for (;;) {
+      // Look for the next of either quote and consume it. (Searching first for
+      // ' and then, only if that failed, for " is wrong: a failure sets pos to
+      // npos and the second search silently never matches.)
+      const std::size_t q = std::min(line.find('\'', pos), line.find('"', pos));
+      if (q == std::string_view::npos) break;
+      const char quote = line[q];
+      const auto end = line.find(quote, q + 1);
+      if (end == std::string_view::npos) break;
+      const std::string content = sanitize_text(line.substr(q + 1, end - q - 1), 96);
+      pos = end + 1;
+      if (content.empty() || content.find(':') == std::string_view::npos) continue;
+      // Split into two or three segments by ':'.
+      const auto c1 = content.find(':');
+      const auto c2 = c1 == std::string_view::npos ? std::string_view::npos : content.find(':', c1 + 1);
+      if (c2 != std::string_view::npos && content.find(':', c2 + 1) != std::string_view::npos) continue;  // classifier form
+      const std::string group = std::string(trim(content.substr(0, c1)));
+      const std::string art = std::string(trim(content.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1)));
+      const std::string ver = c2 == std::string_view::npos ? std::string() : std::string(trim(content.substr(c2 + 1)));
+      const std::string name = group + ":" + art;
+      if (group.empty() || art.empty() || !is_maven_coordinate(name)) continue;
+      PkgSpec s;
+      s.kind = "maven";
+      s.name = name;
+      s.spec = version_spec(ver);
+      s.unverifiable = !version_testable(s.spec);
+      if (!s.unverifiable) s.required_min = spec_min(Eco::Maven, s.spec);
+      if (!s.required_min.empty() || s.unverifiable) push(out, std::move(s));
+    }
   }
   return out;
 }
@@ -1111,22 +1288,22 @@ std::string probe_cargo_version(std::string_view name, const std::string& projec
   return {};
 }
 
+// Go writes versions with a leading "v" everywhere: go.mod, go.sum and the
+// module cache filenames. Normalise to that form on every probe path so the
+// recorded `version` does not depend on which source answered.
+std::string go_version_text(const Version& v) { return "v" + version_string(v); }
+
 std::string probe_go_version(std::string_view name, const std::string& project_root) {
   if (!is_eco_package_name(Eco::Go, name)) return {};
   const std::string mod(name);
-  // go.sum records "<module> <version> h1:...", one per line.
+  // go.sum records "<module> <version> h1:...", twice per version. Look the
+  // module up as a whole key so a longer path sharing this prefix cannot be
+  // mistaken for it, and take the highest version when several are listed.
   if (!project_root.empty()) {
     if (auto txt = read_file_under(project_root, "go.sum", 8u << 20)) {
-      for (const auto& raw : split(*txt, '\n')) {
-        const std::string_view line = trim(raw);
-        if (line.empty() || line.rfind(mod, 0) != 0) continue;
-        const std::size_t sp = line.find(' ');
-        if (sp == std::string_view::npos) continue;
-        std::string_view ver = trim(line.substr(sp));
-        const auto sp2 = ver.find(' ');
-        if (sp2 != std::string_view::npos) ver = ver.substr(0, sp2);
-        if (auto v = parse_pkg_version(ver); v && !v->empty()) return version_string(*v);
-      }
+      const auto sums = parse_go_sum(*txt);
+      const auto it = sums.find(mod);
+      if (it != sums.end()) return it->second;
     }
   }
   // A vendored tree keeps the version in modules.txt.
@@ -1137,7 +1314,7 @@ std::string probe_go_version(std::string_view name, const std::string& project_r
         if (line.rfind("# " + mod + " ", 0) != 0) continue;
         const auto vpos = line.find(' ');
         if (vpos == std::string_view::npos) continue;
-        if (auto v = parse_pkg_version(line.substr(vpos + 1)); v && !v->empty()) return version_string(*v);
+        if (auto v = parse_pkg_version(line.substr(vpos + 1)); v && !v->empty()) return go_version_text(*v);
       }
     }
   }
@@ -1150,7 +1327,10 @@ std::string probe_go_version(std::string_view name, const std::string& project_r
   for (char c : mod) esc.push_back(std::isupper(static_cast<unsigned char>(c)) != 0 ? static_cast<char>('!' + (c - 'A' + 'a')) : c);
   const std::string dir = cache + "/" + esc + "/@v";
   std::error_code ec;
-  std::string best;
+  // Keep the winning Version alongside its text: comparing by re-parsing the
+  // text would have to strip the "v" first, and one missed parse would leave
+  // an empty Version here.
+  Version best;
   std::size_t budget = kMaxDirEntries;
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end && budget > 0; it.increment(ec), --budget) {
     const std::string fn = it->path().filename().string();
@@ -1158,10 +1338,11 @@ std::string probe_go_version(std::string_view name, const std::string& project_r
     const std::string ver = fn.substr(0, fn.size() - 4);
     if (ver.find(".mod") != std::string::npos || ver.find(".info") != std::string::npos) continue;
     if (auto v = parse_pkg_version(ver); v && !v->empty()) {
-      if (best.empty() || compare_versions(*v, *parse_version(best)) > 0) best = version_string(*v);
+      if (best.parts.empty() || compare_versions(*v, best) > 0) best = *v;
     }
   }
-  return best;
+  if (best.parts.empty()) return {};
+  return go_version_text(best);
 }
 
 EcoProbe probe_eco_package(Eco eco, std::string_view name, const std::string& project_root) {
