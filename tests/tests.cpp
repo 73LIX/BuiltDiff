@@ -4,6 +4,8 @@
 #include <string>
 
 #include "analyze.hpp"
+#include "compare.hpp"
+#include "ecosystems.hpp"
 #include "elf.hpp"
 #include "http.hpp"
 #include "json.hpp"
@@ -151,6 +153,220 @@ static void test_scan_and_snapshot() {
   }
 }
 
+// Language-package layer. Every assertion here is about correctness of an
+// answer the user will act on, or about refusing to guess.
+static void test_ecosystems() {
+  // ---- PEP 503 and npm name normalization
+  CHECK(normalize_pep503("Flask_SQLAlchemy") == "flask-sqlalchemy");
+  CHECK(normalize_pep503("foo.bar") == "foo-bar");
+  CHECK(is_eco_package_name(Eco::Pip, "Flask-SQLAlchemy"));
+  CHECK(is_eco_package_name(Eco::Npm, "@types/node"));
+  CHECK(!is_eco_package_name(Eco::Npm, "foo/bar"));       // not scoped
+  CHECK(!is_eco_package_name(Eco::Cargo, "../evil"));      // no traversal
+  CHECK(!is_eco_package_name(Eco::Cargo, "a/b"));          // crates are one segment
+  CHECK(is_eco_package_name(Eco::Cargo, "serde_json"));
+  CHECK(!is_eco_package_name(Eco::Go, "../evil"));
+  CHECK(!is_eco_package_name(Eco::Go, "/abs/mod"));
+  CHECK(!is_eco_package_name(Eco::Go, "a//b"));
+  CHECK(!is_eco_package_name(Eco::Go, "a/../b"));
+  CHECK(!is_eco_package_name(Eco::Pip, ""));
+  CHECK(!is_eco_package_name(Eco::Native, "zlib"));
+  CHECK(is_eco_package_name(Eco::Go, "github.com/gin-gonic/gin"));
+  CHECK(is_eco_package_name(Eco::Maven, "com.google.guava"));
+  CHECK(!is_eco_package_name(Eco::Maven, "guava:jar:1.0")); // group only
+  // A maven coordinate carries a colon, so it has its own validator.
+  CHECK(is_maven_coordinate("com.google.guava:guava"));
+  CHECK(!is_maven_coordinate("guava"));            // no group
+  CHECK(!is_maven_coordinate(":guava"));           // empty group
+  CHECK(!is_maven_coordinate("com.foo:"));         // empty artifact
+  CHECK(!is_maven_coordinate("a:b:c"));            // two colons
+  CHECK(!is_maven_coordinate("com.foo:bar;rm -rf /"));
+
+  // ---- version specifiers
+  CHECK(check_spec(Eco::Pip, "1.2.3", "==1.2.3") == Verdict::Ok);
+  CHECK(check_spec(Eco::Pip, "latest", ">=1") == Verdict::Unknown);  // unparseable version
+  CHECK(check_spec(Eco::Pip, "6.1.1", ">=5.9,<7") == Verdict::Ok);
+  CHECK(check_spec(Eco::Pip, "7.2.2", ">=5.9,<7") == Verdict::TooNew);  // above the ceiling, not below the floor
+  CHECK(check_spec(Eco::Pip, "5.0", ">=5.9") == Verdict::TooOld);
+  CHECK(check_spec(Eco::Npm, "1.2.9", "^1.2.0") == Verdict::Ok);
+  CHECK(check_spec(Eco::Npm, "2.0.0", "^1.2.0") == Verdict::TooNew);
+  CHECK(check_spec(Eco::Npm, "1.2.99", "~1.2.0") == Verdict::Ok);
+  CHECK(check_spec(Eco::Npm, "1.3.0", "~1.2.0") == Verdict::TooNew);  // ~1.2.0 excludes 1.3.0
+  CHECK(check_spec(Eco::Npm, "1.2.9", "1.2.x") == Verdict::Ok);    // 1.2.x is <1.3.0
+  CHECK(check_spec(Eco::Npm, "1.3.0", "1.2.x") == Verdict::TooNew);
+  CHECK(check_spec(Eco::Npm, "1.3.0", "*") == Verdict::Ok);          // "*" is unconstrained
+  CHECK(check_spec(Eco::Cargo, "0.5.9", "^0.5") == Verdict::Ok);
+  CHECK(check_spec(Eco::Cargo, "0.6.0", "^0.5") == Verdict::TooNew);  // ^0.5 pins the minor
+  CHECK(check_spec(Eco::Cargo, "0.4.9", "^0.5") == Verdict::TooOld);
+  CHECK(check_spec(Eco::Maven, "33.2.1", "[33,34)") == Verdict::Ok);
+  CHECK(check_spec(Eco::Maven, "32.1", "[33,34)") == Verdict::TooOld);
+  CHECK(check_spec(Eco::Go, "1.21.0", ">=1.20") == Verdict::Ok);
+  // A spec we cannot understand must never be reported as satisfied-by-assumption
+  // nor as a failure the user cannot act on.
+  CHECK(check_spec(Eco::Pip, "1.0", "git+https://x/y.git#egg=z") == Verdict::Unknown);
+  CHECK(check_spec(Eco::Npm, "1.0", "workspace:*") == Verdict::Unknown);
+  CHECK(check_spec(Eco::Pip, "1.0", "") == Verdict::Ok);       // no constraint
+  CHECK(check_spec(Eco::Pip, "1.0", "==1.0") == Verdict::Ok);
+  CHECK(check_spec(Eco::Pip, "1.1", "==1.0") == Verdict::TooNew);  // == is exact both ways
+  CHECK(check_spec(Eco::Maven, "31.0.0", "33.0.0") == Verdict::TooOld);   // bare maven version = pin
+  CHECK(check_spec(Eco::Maven, "34.0.0", "33.0.0") == Verdict::TooNew);
+  CHECK(check_spec(Eco::Pip, "31.0.0-jre", ">=33.0.0") == Verdict::TooOld);  // qualifier tolerated
+  CHECK(check_spec(Eco::Go, "v1.2.3", "v1.2.3") == Verdict::Ok);
+  CHECK(check_spec(Eco::Cargo, "1.0", "*") == Verdict::Ok);
+  CHECK(check_spec(Eco::Cargo, "0.5.1", "~0.5.0") == Verdict::Ok);
+  CHECK(check_spec(Eco::Cargo, "1.0.9", "1.0.*") == Verdict::Ok);   // cargo uses * too
+
+  // ---- requirements.txt
+  {
+    auto pkgs = parse_requirements("Flask==2.3.0\n# a comment\n\nrich>=13,<15 \\\n  # inline comment\n  ; py3 marker\nnumpy\n");
+    CHECK(pkgs.size() == 3);
+    if (pkgs.size() == 3) {
+      CHECK(pkgs[0].name == "flask" && pkgs[0].spec == "==2.3.0" && pkgs[0].required_min == "2.3.0");
+      CHECK(pkgs[1].name == "rich" && pkgs[1].spec == ">=13,<15");   // continuation joined
+      CHECK(pkgs[2].name == "numpy");                                // bare name, no constraint
+    }
+    // Options, markers and editable/URL installs must not be mistaken for names.
+    CHECK(parse_requirements("--index-url https://pypi.org/simple\n").empty());
+    CHECK(parse_requirements("foo[extra]>=1\n").size() == 1);
+    CHECK(parse_requirements("-e git+https://x/y.git#egg=z\n").empty());
+  }
+
+  // ---- pyproject / package.json / cargo / go / maven
+  {
+    auto pp = parse_pyproject_deps(R"([project]
+name = "demo"
+dependencies = ["flask>=2.3", "rich"]
+[project.optional-dependencies]
+dev = ["pytest~=8.0"]
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+)");
+    CHECK(pp.size() == 4);
+    for (const auto& p : pp) CHECK(eco_from_kind(p.kind) == Eco::Pip);
+    auto pj = parse_package_json_deps(R"({"dependencies":{"lodash":"^4.17.21"},"devDependencies":{"vitest":"~1.0.0"}})");
+    CHECK(pj.size() == 2 && eco_from_kind(pj[0].kind) == Eco::Npm);
+    auto ct = parse_cargo_deps(R"([dependencies]
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0.*"
+tokio = { version = ">=1.35, <2" }
+
+[dev-dependencies]
+tempfile = "3"
+)");
+    CHECK(ct.size() == 4);
+    for (const auto& p : ct) CHECK(eco_from_kind(p.kind) == Eco::Cargo);
+    auto gm = parse_go_mod_requires(R"(
+module example.com/m
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	golang.org/x/text v0.14.0 // indirect
+)
+
+require github.com/spf13/cobra v1.8.0
+)");
+    CHECK(gm.size() == 3);
+    for (const auto& p : gm) CHECK(eco_from_kind(p.kind) == Eco::Go);
+    auto pm = parse_pom_deps(R"(<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <dependencies>
+    <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>33.0.0</version></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>[5.10,6)</version></dependency>
+    <dependency><groupId>com.example</groupId><artifactId>placeholder</artifactId><version>${foo.version}</version></dependency>
+  </dependencies>
+</project>)");
+    CHECK(pm.size() == 3);
+    if (pm.size() == 3) {
+      CHECK(pm[0].name == "com.google.guava:guava" && pm[0].required_min == "33.0.0");
+      CHECK(pm[1].spec == "[5.10,6)");
+      CHECK(pm[2].unverifiable);   // property placeholder, not a literal version
+    }
+  }
+
+  // ---- lock files pin exact versions
+  {
+    auto lock = parse_cargo_lock(R"([[package]]
+name = "serde"
+version = "1.0.196"
+[[package]]
+name = "anyhow"
+version = "1.0.79")");
+    CHECK(lock.size() == 2);
+    if (lock.size() == 2) CHECK(lock[0].name == "serde" && lock[0].version_locked == "1.0.196");
+    // go.sum pins go.mod requirements the same way; verify the "/go.mod"
+    // duplicate lines do not produce two entries for one module.
+    auto gomod = parse_go_mod_requires("require github.com/gin-gonic/gin v1.9.1\n");
+    CHECK(gomod.size() == 1 && gomod[0].version_locked == "v1.9.1");
+  }
+
+  // ---- probing never guesses. No package exists under these names anywhere,
+  // so every probe must report not-found rather than inventing a version.
+  {
+    const std::string root = "/nonexistent-builtdiff-fixture";
+    for (Eco eco : {Eco::Pip, Eco::Npm, Eco::Cargo, Eco::Maven, Eco::Go}) {
+      const EcoProbe p = probe_eco_package(eco, "builtdiff-nonexistent-pkg-xyzzy", root);
+      CHECK(!p.found);
+      CHECK(p.version.empty());
+    }
+    CHECK(!probe_eco_package(Eco::Native, "zlib", root).found);
+  }
+
+  // ---- install hints are suggestions, never shell
+  {
+    CHECK(project_has_venv("/nonexistent-builtdiff-fixture") == false);
+    const std::string hint = eco_install_hint(Eco::Pip, "psutil", "/nonexistent-builtdiff-fixture");
+    CHECK(hint.find("pip install psutil") != std::string::npos);
+    // A hostile name from a snapshot file must not survive into the hint.
+    CHECK(eco_install_hint(Eco::Pip, "psutil; rm -rf /", "/x").empty());
+    CHECK(eco_install_hint(Eco::Native, "zlib", "/x").empty());
+    CHECK(eco_install_hint(Eco::Pip, "../etc/passwd", "/x").empty());
+    CHECK(eco_install_command(Eco::Npm, {"lodash", "bad name;x"}, "/x") == "npm install lodash");
+  }
+}
+
+// A snapshot whose libraries are language packages must round-trip and must
+// still load under the older schema fields.
+static void test_snapshot_ecosystem_roundtrip() {
+  auto r = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "build":{"package_managers":["pip"]},
+    "libraries":[{"name":"psutil","kind":"pip","found":true,"version":"6.1.1","required_min":"5.9","spec":">=5.9,<7"},
+                 {"name":"lodash","kind":"npm","found":true,"version":"4.17.21","spec":"^4.17.21"}]})");
+  CHECK(r.snap.has_value());
+  if (!r.snap) return;
+  CHECK(r.snap->build.package_managers.size() == 1 && r.snap->build.package_managers[0] == "pip");
+  CHECK(r.snap->libs.size() == 2);
+  if (r.snap->libs.size() != 2) return;
+  CHECK(eco_from_kind(r.snap->libs[0].kind) == Eco::Pip);
+  CHECK(r.snap->libs[0].spec == ">=5.9,<7");
+  CHECK(eco_from_kind(r.snap->libs[1].kind) == Eco::Npm);
+  // A library name that is not a valid package for its declared kind is dropped,
+  // so a hostile snapshot cannot inject text into later install hints.
+  auto mvn = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "libraries":[{"name":"com.google.guava:guava","kind":"maven","found":true,"version":"33.0.0"}]})");
+  CHECK(mvn.snap && mvn.snap->libs.size() == 1);   // a real coordinate survives the load
+  // A qualified version must not be blanked on reload: "31.0.0-jre" is what
+  // maven actually installs, and losing it turns a found dependency into an
+  // unverifiable one on the next run.
+  auto qual = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "libraries":[{"name":"com.google.guava:guava","kind":"maven","found":true,"version":"31.0.0-jre"}]})");
+  CHECK(qual.snap && qual.snap->libs.size() == 1 && qual.snap->libs[0].version == "31.0.0-jre");
+  // A native version stays strict: only digits and dots.
+  auto natv = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "libraries":[{"name":"zlib","kind":"native","found":true,"version":"1.2.3-rc"}]})");
+  CHECK(natv.snap && natv.snap->libs.size() == 1 && natv.snap->libs[0].version.empty());
+  auto badmvn = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "libraries":[{"name":"com.foo:bar;rm -rf /","kind":"maven","found":true,"version":"1"}]})");
+  CHECK(badmvn.snap && badmvn.snap->libs.empty());
+  auto bad = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "libraries":[{"name":"evil;rm -rf /","kind":"pip","found":true,"version":"1"}]})");
+  CHECK(bad.snap && bad.snap->libs.empty());
+  // A native library is unaffected by the ecosystem validator.
+  auto native = parse_snapshot(R"({"builtdiff_version":1,"project":"p","platform":{"os":"linux","arch":"x86_64"},
+    "libraries":[{"name":"zlib","kind":"native","found":true,"version":"1.3"}]})");
+  CHECK(native.snap && native.snap->libs.size() == 1);
+}
+
 int main() {
   test_json();
   test_util();
@@ -159,6 +375,8 @@ int main() {
   test_ndjson();
   test_elf_robustness();
   test_scan_and_snapshot();
+  test_ecosystems();
+  test_snapshot_ecosystem_roundtrip();
   std::printf("%d checks, %d failed\n", g_run, g_fail);
   return g_fail ? 1 : 0;
 }
