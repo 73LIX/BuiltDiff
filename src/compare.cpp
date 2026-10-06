@@ -280,26 +280,100 @@ void check_build(Ctx& c) {
 
 void check_libraries(Ctx& c) {
   if (c.snap.libs.empty()) return;
-  auto probes = parallel_map(c.snap.libs, [&](const Library& l) { return c.prober.probe_library(l.name); });
+  // Native libraries and language packages are probed by different means, so
+  // split them first. probe_library knows nothing about site-packages and would
+  // report every pip dependency as missing.
+  std::vector<std::size_t> native, pkgs;
+  for (std::size_t i = 0; i < c.snap.libs.size(); ++i)
+    (eco_from_kind(c.snap.libs[i].kind) == Eco::Native ? native : pkgs).push_back(i);
+  std::vector<LibProbe> probes(c.snap.libs.size());
+  {
+    std::vector<Library> tmp;
+    tmp.reserve(native.size());
+    for (std::size_t i : native) tmp.push_back(c.snap.libs[i]);
+    auto np = parallel_map(tmp, [&](const Library& l) { return c.prober.probe_library(l.name); });
+    for (std::size_t k = 0; k < native.size(); ++k) probes[native[k]] = np[k];
+  }
+  for (std::size_t i : pkgs) {
+    const EcoProbe e = probe_eco_package(eco_from_kind(c.snap.libs[i].kind), c.snap.libs[i].name, c.root);
+    probes[i] = LibProbe{e.found, e.version, e.via};
+  }
   for (std::size_t i = 0; i < c.snap.libs.size(); ++i) {
     const Library& l = c.snap.libs[i];
     const LibProbe& p = probes[i];
-    Item it = make("libraries", Status::Ok, "LIB_OK", l.name, l.name);
+    const Eco eco = eco_from_kind(l.kind);
+    Item it = make(eco == Eco::Native ? "libraries" : "packages", Status::Ok,
+                   eco == Eco::Native ? "LIB_OK" : "PKG_OK", l.name, l.name);
     it.dev = l.found ? or_str(l.version, "found") : "not verified";
+    if (eco != Eco::Native) {
+      // "pip install psutil>=5.9,<7" is not a valid command, so show the
+      // constraint separately from the install line the hint suggests.
+      if (!l.spec.empty() && l.spec != l.required_min) it.dev += " (" + l.spec + ")";
+      it.hint = eco_install_hint(eco, l.name, c.root);
+      it.hint_scope = Item::HintScope::Local;
+    }
     if (!p.found) {
       it.status = l.required ? (l.found ? Status::Fail : Status::Warn) : Status::Info;
-      it.code = "LIB_MISSING";
-      it.title = l.name + " library not found";
+      it.code = eco == Eco::Native ? "LIB_MISSING" : "PKG_MISSING";
+      it.title = eco == Eco::Native ? l.name + " library not found" : std::string(eco_label(eco)) + " '" + l.name + "' is not installed";
       it.you = "not found";
-      it.detail = "Needed by the build (" + l.kind + ")" + (l.required_min.empty() ? "" : ", version >= " + l.required_min) + ".";
+      it.detail = "Needed by the build (" + l.kind + ")";
+      if (!l.required_min.empty()) it.detail += ", version >= " + l.required_min;
+      else if (!l.spec.empty()) it.detail += ", version " + l.spec;
+      it.detail += ".";
       if (!l.required) it.detail += " It is optional.";
       if (!l.found) it.detail += " The developer's snapshot could not verify it either.";
+      if (eco != Eco::Native) {
+        // No distro package mapping exists for these: the install hint set
+        // above is the right advice, and leaving it.pkgs empty keeps it out of
+        // the aggregated "sudo pacman -S ..." line.
+        c.add(std::move(it));
+        continue;
+      }
       it.pkgs = packages_for_library(c.rep.pkgmgr, l.name);
       if (it.pkgs.empty())
         it.hint = "Search for it: " + std::string(c.rep.pkgmgr == PkgMgr::Pacman ? "pacman -Ss " : c.rep.pkgmgr == PkgMgr::Apt ? "apt search " :
                                                   c.rep.pkgmgr == PkgMgr::Dnf ? "dnf search " : "your package manager: search ") + to_lower(l.name);
     } else {
       it.you = or_str(p.version, "found") + " (" + p.via + ")";
+      if (eco != Eco::Native) {
+        // The ecosystem parser understands the full specifier grammar (^, ~,
+        // x-ranges, maven ranges, ">=1,<2"), which parse_version cannot.
+        const Verdict v = check_spec(eco, p.version, l.spec.empty() ? l.required_min : l.spec);
+        const std::string want = l.spec.empty() ? l.required_min : l.spec;
+        if (v == Verdict::TooOld) {
+          it.status = Status::Fail;
+          it.code = "PKG_TOO_OLD";
+          it.title = std::string(eco_label(eco)) + " '" + l.name + "' " + p.version + " does not satisfy " + want;
+          it.detail = "The project requires " + want + ".";
+        } else if (v == Verdict::TooNew) {
+          // Newer is not broken, but it is also not "satisfied": an upper bound
+          // or a caret range exists precisely to exclude this version, so
+          // silently calling it ok would hide a real incompatibility.
+          it.status = Status::Warn;
+          it.code = "PKG_TOO_NEW";
+          it.title = std::string(eco_label(eco)) + " '" + l.name + "' " + p.version + " is newer than the project allows (" + want + ")";
+          it.detail = "Usually fine, but an untested version can change behaviour.";
+        } else if (!l.version_locked.empty() && p.version != l.version_locked) {
+          // A lock file is an exact pin. Minor drift is not a build failure but
+          // it is worth seeing, so this warns rather than fails.
+          it.status = Status::Warn;
+          it.code = "PKG_DRIFT";
+          it.title = std::string(eco_label(eco)) + " '" + l.name + "' is " + p.version + ", the lock file pins " + l.version_locked;
+        } else if (v == Verdict::Unknown && l.unverifiable) {
+          // A git URL, a maven ${property}, a workspace protocol. Say plainly
+          // that it was not checked; do not imply it was.
+          it.status = Status::Info;
+          it.code = "PKG_UNVERIFIABLE";
+          it.title = std::string(eco_label(eco)) + " '" + l.name + "' uses a version builtdiff cannot evaluate";
+          it.detail = "Install it the way the project's own lock file or docs say; builtdiff only checked that " + p.version +
+                      " is present.";
+        } else {
+          it.title = std::string(eco_label(eco)) + " '" + l.name + "' satisfied";
+        }
+        c.add(std::move(it));
+        continue;
+      }
       auto u = parse_version(p.version), d = parse_version(l.version), m = parse_version(l.required_min);
       if (u && m && compare_versions(*u, *m) < 0) {
         it.status = Status::Fail;
@@ -488,13 +562,19 @@ void check_runtime(Ctx& c) {
 }
 
 int layer_index(const std::string& l) {
-  static const char* order[] = {"system", "toolchain", "build", "libraries", "runtime"};
-  for (int i = 0; i < 5; ++i)
+  // "packages" sits between "libraries" and "runtime": a language package is a
+  // static requirement like a library, and both are settled before we look at
+  // what a prebuilt binary needs at run time.
+  static const char* order[] = {"system", "toolchain", "build", "libraries", "packages", "runtime"};
+  for (int i = 0; i < 6; ++i)
     if (l == order[i]) return i;
-  return 5;
+  return 6;
 }
 
 bool is_missing_code(const std::string& code) {
+  // PKG_MISSING is deliberately NOT here: language packages are installed with
+  // their own manager into the project's environment, never with the distro
+  // package manager, so they must not land in the single "sudo pacman -S" line.
   return code == "TOOL_MISSING" || code == "GROUP_MISSING" || code == "LIB_MISSING" || code == "RUNTIME_LIB_MISSING" ||
          code == "LOADER_MISSING";
 }
@@ -516,6 +596,7 @@ const char* layer_title(const std::string& l) noexcept {
   if (l == "toolchain") return "TOOLCHAIN";
   if (l == "build") return "BUILD SYSTEM";
   if (l == "libraries") return "LIBRARIES";
+  if (l == "packages") return "LANGUAGE PACKAGES";
   if (l == "runtime") return "RUNTIME";
   return "OTHER";
 }
@@ -588,6 +669,10 @@ json::Value report_to_json(const Report& r) {
     for (const auto& p : it.pkgs) pk.push(p);
     o.set("packages", std::move(pk));
     o.set("hint", it.hint);
+    // Tells a consumer whether the hint is a distro command or one to run inside
+    // the project's own environment. Absent for the native default, so existing
+    // JSON consumers see no change.
+    if (it.hint_scope == Item::HintScope::Local) o.set("hint_scope", "project");
     items.push(std::move(o));
   }
   root.set("items", std::move(items));
