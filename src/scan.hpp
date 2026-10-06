@@ -10,14 +10,18 @@
 #include <string>
 #include <vector>
 
+#include "ecosystems.hpp"
 #include "model.hpp"
 
 namespace bd {
 
 struct LibSpec {
   std::string name;
-  std::string kind;  // cmake | pkg-config | make | meson
+  std::string kind;  // cmake | pkg-config | make | meson | pip | npm | cargo | maven | go
   std::string required_min;
+  std::string spec;           // the constraint as written, for language packages
+  std::string version_locked; // exact version a lock file pinned, when present
+  bool unverifiable = false;  // version came from something we cannot evaluate
   bool required = true;
 };
 
@@ -25,6 +29,10 @@ struct ScanResult {
   std::string project_name;
   BuildInfo build;
   std::vector<LibSpec> libs;
+  // Language package dependencies, already normalised by the ecosystem parsers.
+  // Kept separate from `libs` only until snapshot.cpp merges them, because the
+  // two sets are probed by completely different mechanisms.
+  std::vector<PkgSpec> packages;
   std::map<std::string, std::string> tool_min;  // tool name -> minimum version demanded
   bool uses_pkgconfig = false;
 };
