@@ -325,6 +325,10 @@ void scan_cargo(const std::string& text, ScanResult& r) {
     if (line.rfind("rust-version", 0) == 0)
       if (auto v = clean_version(toml_string_value(line)); !v.empty()) r.tool_min["rustc"] = v;
   }
+  // Crate names and their caret constraints. The workspace members themselves
+  // live in [package] and are not dependencies, so parse_cargo_deps's
+  // section scoping keeps them out.
+  merge_specs(r.packages, parse_cargo_deps(text));
 }
 
 void scan_package_json(const std::string& text, ScanResult& r) {
@@ -337,6 +341,7 @@ void scan_package_json(const std::string& text, ScanResult& r) {
     if (nv.rfind(">=", 0) == 0 || nv.rfind('^', 0) == 0 || nv.rfind('~', 0) == 0 || (!nv.empty() && std::isdigit(static_cast<unsigned char>(nv[0]))))
       if (auto v = clean_version(nv); !v.empty()) r.tool_min["node"] = v;
   }
+  merge_specs(r.packages, parse_package_json_deps(text));
 }
 
 void scan_pyproject(const std::string& text, ScanResult& r) {
@@ -350,6 +355,19 @@ void scan_pyproject(const std::string& text, ScanResult& r) {
     if (line.rfind("name", 0) == 0 && r.project_name.empty() && line.find('=') != std::string_view::npos)
       r.project_name = sanitize_text(toml_string_value(line), 64);
   }
+  merge_specs(r.packages, parse_pyproject_deps(text));
+}
+
+void scan_requirements(const std::string& text, ScanResult& r) {
+  merge_specs(r.packages, parse_requirements(text));
+}
+
+void scan_setup_py(const std::string& text, ScanResult& r) {
+  merge_specs(r.packages, parse_setup_py_deps(text));
+}
+
+void scan_pom(const std::string& text, ScanResult& r) {
+  merge_specs(r.packages, parse_pom_deps(text));
 }
 
 void scan_go_mod(const std::string& text, ScanResult& r) {
@@ -363,6 +381,7 @@ void scan_go_mod(const std::string& text, ScanResult& r) {
       r.project_name = sanitize_text(slash == std::string::npos ? m : m.substr(slash + 1), 64);
     }
   }
+  merge_specs(r.packages, parse_go_mod_requires(text));
 }
 
 void detect_languages(const std::string& root, ScanResult& r) {
@@ -417,13 +436,14 @@ ScanResult scan_project(const std::string& root) {
       {"meson.build", "meson", scan_meson},
       {"Cargo.toml", "cargo", scan_cargo},
       {"package.json", "npm", scan_package_json},
-      {"pom.xml", "maven", nullptr},
+      {"pom.xml", "maven", scan_pom},
       {"build.gradle", "gradle", nullptr},
       {"build.gradle.kts", "gradle", nullptr},
       {"go.mod", "go", scan_go_mod},
+      {"go.sum", "go", nullptr},
       {"pyproject.toml", "python", scan_pyproject},
-      {"setup.py", "python", nullptr},
-      {"requirements.txt", "python", nullptr},
+      {"setup.py", "python", scan_setup_py},
+      {"requirements.txt", "python", scan_requirements},
       {"configure.ac", "autotools", nullptr},
   };
   for (const auto& e : entries) {
@@ -433,6 +453,55 @@ ScanResult scan_project(const std::string& root) {
     r.build.files.push_back({e.file, sha256_hex(*text)});
     if (e.fn) e.fn(*text, r);
   }
+  // A lock file pins exact versions, which is strictly better information than
+  // the manifest ranges. Read it after the manifests so it wins, and only keep
+  // names that are actually declared dependencies: Cargo.lock and go.sum also
+  // list transitive crates and modules that the project never names directly,
+  // and reporting those as requirements would bury the real ones.
+  if (auto lock = read_file_under(root, "Cargo.lock", kMaxBuildFile)) {
+    std::vector<PkgSpec> pinned;
+    for (auto& p : parse_cargo_lock(*lock)) {
+      const bool declared = std::any_of(r.packages.begin(), r.packages.end(), [&](const PkgSpec& d) {
+        return d.kind == "cargo" && d.name == p.name;
+      });
+      if (!declared) continue;
+      p.spec.clear();
+      p.required_min = p.version_locked;  // the lock is exact, so use it as the bound
+      pinned.push_back(std::move(p));
+    }
+    merge_specs(r.packages, pinned);
+  }
+  if (auto sum = read_file_under(root, "go.sum", kMaxBuildFile)) {
+    // go.sum lists a module once per dependency edge plus its /go.mod hash.
+    // probe_go_version already reads it for versions; here we only use it to
+    // pin declared modules, so take the highest version per module path.
+    std::map<std::string, std::string> best;
+    for (const auto& raw : split(*sum, '\n')) {
+      const std::string_view line = trim(raw);
+      const std::size_t sp = line.find(' ');
+      if (sp == std::string_view::npos) continue;
+      const std::string mod = sanitize_text(line.substr(0, sp), 128);
+      std::string_view ver = trim(line.substr(sp + 1));
+      const std::size_t sp2 = ver.find(' ');
+      if (sp2 != std::string_view::npos) ver = ver.substr(0, sp2);
+      const std::string vs = sanitize_text(ver, 48);
+      if (mod.empty() || vs.empty()) continue;
+      auto it = best.find(mod);
+      if (it == best.end() || it->second < vs) best[mod] = vs;
+    }
+    std::vector<PkgSpec> pinned;
+    for (auto& d : r.packages) {
+      if (d.kind != "go") continue;
+      const auto it = best.find(d.name);
+      if (it == best.end()) continue;
+      d.version_locked = it->second;
+    }
+  }
+
+  // Record which ecosystems this snapshot carries so `check` can tell a
+  // native-only project from one that also has packages.
+  for (const auto& p : r.packages) add_unique(r.build.package_managers, p.kind);
+
   if (r.project_name.empty()) {
     std::error_code ec;
     r.project_name = sanitize_text(fs::path(root).filename().string(), 64);
