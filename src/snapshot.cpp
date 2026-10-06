@@ -212,6 +212,18 @@ std::string make_starter_config(const std::string& root) {
 // ------------------------------------------------------------ creating
 
 namespace {
+
+// Adapts the ecosystem probe to the native LibProbe shape so one loop can build
+// Library entries for both kinds of dependency.
+LibProbe probe_eco_library(const LibSpec& l, const std::string& root) {
+  LibProbe p;
+  const EcoProbe e = probe_eco_package(eco_from_kind(l.kind), l.name, root);
+  p.found = e.found;
+  p.version = e.version;
+  p.via = e.via;
+  return p;
+}
+
 std::string detect_primary(const std::string& group, const std::vector<Tool>& tools) {
   const char* env = group == "cxx" ? "CXX" : "CC";
   const char* fallback_cc = group == "cxx" ? "g++" : "gcc";
@@ -322,6 +334,9 @@ CreateResult create_snapshot(const std::string& root, const SnapshotOptions& opt
       cr.notes.push_back("The project asks for " + name + " >= " + ver + " but " + name + " was not found on this machine.");
 
   // ---- libraries
+  // Native linkage and language packages share one Library list and one
+  // kMaxLibs budget, but they are probed differently: pkg-config/ldconfig for
+  // one, a filesystem scan of site-packages/node_modules/... for the other.
   std::vector<LibSpec> specs = scan.libs;
   for (const auto& l : opts.extra.libraries) {
     LibSpec ls;
@@ -330,19 +345,44 @@ CreateResult create_snapshot(const std::string& root, const SnapshotOptions& opt
     auto same = [&](const LibSpec& x) { return iequals(x.name, l); };
     if (std::none_of(specs.begin(), specs.end(), same)) specs.push_back(std::move(ls));
   }
-  auto lib_probes = parallel_map(specs, [&](const LibSpec& l) { return prober.probe_library(l.name); });
+  // Package manifests are already in hand, so these need no native prober.
+  for (const auto& p : scan.packages) {
+    LibSpec ls;
+    ls.name = p.name;
+    ls.kind = p.kind;
+    ls.required_min = p.required_min;
+    ls.required = p.required;
+    ls.spec = p.spec;
+    ls.version_locked = p.version_locked;
+    ls.unverifiable = p.unverifiable;
+    specs.push_back(std::move(ls));
+  }
+  auto lib_probes = parallel_map(specs, [&](const LibSpec& l) {
+    const Eco eco = eco_from_kind(l.kind);
+    if (eco == Eco::Native) return prober.probe_library(l.name);
+    return probe_eco_library(l, root);
+  });
   for (std::size_t i = 0; i < specs.size() && s.libs.size() < kMaxLibs; ++i) {
     Library l;
     l.name = specs[i].name;
     l.kind = specs[i].kind;
     l.required_min = specs[i].required_min;
+    l.spec = specs[i].spec;
+    l.version_locked = specs[i].version_locked;
+    l.unverifiable = specs[i].unverifiable;
     l.required = specs[i].required;
     l.found = lib_probes[i].found;
     l.version = lib_probes[i].version;
     l.via = lib_probes[i].via;
-    if (!l.found)
-      cr.notes.push_back("Library '" + l.name + "' (" + l.kind + ") was not found on THIS machine - it is recorded "
-                         "as a requirement but without a reference version.");
+    if (!l.found) {
+      if (specs[i].unverifiable)
+        cr.notes.push_back("Package '" + l.name + "' is pinned to something builtdiff cannot evaluate (" +
+                           (l.spec.empty() ? std::string("no version") : l.spec) +
+                           "); it is recorded as a requirement without a reference version.");
+      else
+        cr.notes.push_back("Library '" + l.name + "' (" + l.kind + ") was not found on THIS machine - it is recorded "
+                           "as a requirement but without a reference version.");
+    }
     s.libs.push_back(std::move(l));
   }
 
@@ -384,6 +424,7 @@ json::Value snapshot_to_json(const Snapshot& s, bool include_fingerprint) {
   Value b = Value::object();
   b.set("systems", jstrs(s.build.systems));
   b.set("languages", jstrs(s.build.languages));
+  if (!s.build.package_managers.empty()) b.set("package_managers", jstrs(s.build.package_managers));
   b.set("cxx_standard", s.build.cxx_standard);
   b.set("c_standard", s.build.c_standard);
   b.set("fetches_network", s.build.fetches_network);
@@ -419,6 +460,16 @@ json::Value snapshot_to_json(const Snapshot& s, bool include_fingerprint) {
     o.set("name", l.name);
     o.set("kind", l.kind);
     o.set("required_min", l.required_min);
+    // spec / version_locked only exist for language packages, so leave them out
+    // for native ones: an old snapshot and a new one stay byte-comparable for a
+    // C/C++ project, which keeps the fingerprint stable.
+    if (eco_from_kind(l.kind) != Eco::Native) {
+      o.set("spec", l.spec);
+      o.set("version_locked", l.version_locked);
+      // Only written when true, so the common case stays identical to the
+      // format produced before this flag existed.
+      if (l.unverifiable) o.set("unverifiable", true);
+    }
     o.set("version", l.version);
     o.set("via", l.via);
     o.set("required", l.required);
@@ -540,6 +591,18 @@ LoadResult parse_snapshot(std::string_view text) {
   if (const auto* b = root.find("build"); b && b->is_object()) {
     s.build.systems = token_list(*b, "systems", 16, 32, ctx);
     s.build.languages = token_list(*b, "languages", 16, 32, ctx);
+    // Older snapshots have no package_managers; that stays valid and means the
+    // project is native-only as far as this snapshot knows.
+    if (const auto* pms = A(*b, "package_managers")) {
+      for (const auto& e : *pms) {
+        const std::string* v = e.as_string();
+        if (!v) continue;
+        const Eco eco = eco_from_kind(*v);
+        if (eco == Eco::Native) continue;
+        if (s.build.package_managers.size() >= 8) { ctx.warn("too many package managers, rest ignored"); break; }
+        add_unique(s.build.package_managers, eco_name(eco));
+      }
+    }
     s.build.cxx_standard = S(*b, "cxx_standard", 8);
     s.build.c_standard = S(*b, "c_standard", 8);
     s.build.fetches_network = json::get_bool(*b, "fetches_network");
@@ -584,16 +647,47 @@ LoadResult parse_snapshot(std::string_view text) {
       if (s.libs.size() >= kMaxLibs) { ctx.warn("too many library entries, rest ignored"); break; }
       Library lib;
       lib.name = json::get_string(l, "name");
-      if (!is_safe_token(lib.name, 64)) {
-        ctx.warn("ignored library with suspicious name '" + sanitize_text(lib.name, 40) + "'");
+      lib.kind = S(l, "kind", 16);
+      // Validate the name against whichever rule the ecosystem uses. This is a
+      // snapshot file, i.e. attacker-controlled input if the snapshot came from
+      // somewhere else, so a package-shaped name is not trusted just because it
+      // looks structured: is_npm_package_name and friends still reject anything
+      // with a path separator, whitespace or a shell metacharacter.
+      const Eco eco = eco_from_kind(lib.kind);
+      // A maven coordinate is "<groupId>:<artifactId>", so validate each half with
+      // the plain group/artifact rule instead of the combined string: the colon
+      // is not part of either rule's charset and would reject every real pom.
+      bool name_ok;
+      if (eco == Eco::Native) {
+        name_ok = is_safe_token(lib.name, 64);
+      } else if (eco == Eco::Maven) {
+        name_ok = is_maven_coordinate(lib.name);
+      } else {
+        name_ok = is_eco_package_name(eco, lib.name);
+      }
+      if (!name_ok) {
+        ctx.warn("ignored " + std::string(eco_label(eco)) + " with suspicious name '" + sanitize_text(lib.name, 40) + "'");
         continue;
       }
-      lib.kind = S(l, "kind", 16);
       lib.required_min = clean_ver(json::get_string(l, "required_min"));
-      lib.version = clean_ver(json::get_string(l, "version"));
+      // Ecosystem versions are compared with parse_pkg_version(), which
+      // understands qualifiers such as "31.0.0-jre", "1.2.3-rc1" and "v2.0".
+      // clean_ver() would blank those out and turn a found package into an
+      // unverifiable one, so the language kinds get the same bounded,
+      // sanitized treatment as a spec instead.
+      lib.version = (eco == Eco::Native) ? clean_ver(json::get_string(l, "version"))
+                                        : S(l, "version", 48);
       lib.via = S(l, "via", 16);
       lib.required = json::get_bool(l, "required", true);
       lib.found = json::get_bool(l, "found");
+      if (eco != Eco::Native) {
+        // Sanitized but not shape-checked: a specifier is a short expression
+        // like "^4.18.0" or ">=5.9,<7", and it is only ever compared by
+        // check_spec, which returns Unknown for anything it cannot parse.
+        lib.spec = S(l, "spec", 64);
+        lib.version_locked = S(l, "version_locked", 48);
+        lib.unverifiable = json::get_bool(l, "unverifiable");
+      }
       s.libs.push_back(std::move(lib));
     }
   }
