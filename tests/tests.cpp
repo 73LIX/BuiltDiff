@@ -1,5 +1,7 @@
 // Minimal self-contained test runner (no external framework).
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 
@@ -367,6 +369,145 @@ static void test_snapshot_ecosystem_roundtrip() {
   CHECK(native.snap && native.snap->libs.size() == 1);
 }
 
+// Regression tests for the post-launch bug round: go.sum handling (prefix
+// match, string-chosen version, first-match-not-highest probe), the drift
+// false positive caused by comparing "v1.9.1" with "1.9.1" as text, and the
+// setup.py parser missing the PEP 8 spaced keyword form.
+static void test_ecosystem_regressions() {
+  // -- go.sum: module paths match whole, not by prefix.
+  {
+    const auto sums = parse_go_sum(R"(github.com/x/y v1.0.0 h1:aaa=
+github.com/x/y v1.0.0/go.mod h1:bbb=
+github.com/x/yz v2.5.0 h1:ccc=
+)");
+    CHECK(sums.size() == 2);                       // /go.mod duplicate collapses
+    CHECK(sums.count("github.com/x/yz") == 1);
+    const auto it = sums.find("github.com/x/y");
+    CHECK(it != sums.end() && it->second == "v1.0.0");   // never 2.5.0, that is yz's
+  }
+  // -- go.sum: the highest version wins, compared as versions not text.
+  {
+    const auto sums = parse_go_sum(R"(golang.org/x/text v1.9.1 h1:a=
+golang.org/x/text v1.10.0 h1:b=
+golang.org/x/text v0.9.0 h1:c=
+)");
+    const auto it = sums.find("golang.org/x/text");
+    CHECK(it != sums.end() && it->second == "v1.10.0");
+  }
+  // -- go.sum: junk lines and hostile module tokens are ignored.
+  {
+    const auto sums = parse_go_sum("github.com/ok/ok v1.0.0 h1:a=\n../evil v2.0.0 h1:b=");
+    CHECK(sums.size() == 1 && sums.count("github.com/ok/ok") == 1);
+  }
+  // -- versions_match: v-prefixed vs bare, and unparseable bytes.
+  {
+    CHECK(versions_match("v1.9.1", "1.9.1"));
+    CHECK(versions_match("1.9.1", "1.9.1"));
+    CHECK(!versions_match("v1.9.1", "1.10.0"));
+    CHECK(!versions_match("v1.9.1", "v1.10.0"));
+    CHECK(versions_match("git-unknown", "git-unknown"));   // same junk is identical
+    CHECK(!versions_match("git-unknown", "git-other"));
+    CHECK(!versions_match("1.9.1", ""));
+  }
+  // -- setup.py: the PEP 8 spaced keyword form must parse.
+  {
+    auto pkgs = parse_setup_py_deps(R"(from setuptools import setup
+setup(
+    name="demo",
+    install_requires = [
+        "flask==2.3.0",
+        "rich>=13, <15",
+    ],
+    setup_requires = ["setuptools>=68"],
+    tests_require = ["pytest~=8.0"],
+)
+)");
+    CHECK(pkgs.size() == 4);
+    if (pkgs.size() == 4) {
+      CHECK(pkgs[0].name == "flask" && pkgs[0].spec == "==2.3.0");
+      CHECK(pkgs[1].name == "rich" && pkgs[1].spec == ">=13, <15");
+      CHECK(pkgs[2].name == "setuptools");
+      CHECK(pkgs[3].name == "pytest");
+    }
+    // And the un-spaced single-line form still works, with no double count.
+    auto tight = parse_setup_py_deps("setup(name=\"d\", install_requires=[\"a\",\"b\"], setup_requires=[\"c\"])");
+    CHECK(tight.size() == 3);
+  }
+  // -- probe_go_version end to end: highest version wins and prefixes are exact.
+  {
+    const auto dir = std::filesystem::temp_directory_path() / "builtdiff-test-gofix";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    {
+      std::ofstream f(dir / "go.sum");
+      f << "github.com/x/y v1.0.0 h1:a=\n"
+           "github.com/x/y v1.0.0/go.mod h1:b=\n"
+           "github.com/x/yz v2.5.0 h1:c=\n"
+           "golang.org/x/text v1.9.1 h1:d=\n"
+           "golang.org/x/text v1.10.0 h1:e=\n";
+    }
+    const std::string root = dir.string();
+    CHECK(probe_go_version("github.com/x/y", root) == "v1.0.0");
+    CHECK(probe_go_version("golang.org/x/text", root) == "v1.10.0");   // highest, not first
+    CHECK(probe_go_version("github.com/x/yz", root) == "v2.5.0");
+    CHECK(probe_go_version("github.com/x/y/z", root).empty());          // longer path: no prefix gift
+    std::filesystem::remove_all(dir, ec);
+  }
+
+  // -- gradle: both DSLs, all three declaration forms, and the shapes that
+  // must never be read as dependencies (plugin ids, versions, projects).
+  {
+    const auto kotlin = parse_gradle_deps(R"kts(plugins {
+    id("org.springframework.boot") version "3.2.0"
+}
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web:3.2.0")
+    implementation("com.google.guava:guava:33.0.0-jre")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.0")
+    implementation("org.slf4j:slf4j-api")
+    implementation(project(":common"))
+    implementation("com.example:dyn:1.+")
+    api("com.fasterxml.jackson.core:jackson-databind:[2.14,3)")
+}
+)kts");
+    CHECK(kotlin.size() == 6);
+    if (kotlin.size() == 6) {
+      CHECK(kotlin[0].name == "org.springframework.boot:spring-boot-starter-web" && kotlin[0].spec == "3.2.0");
+      CHECK(!kotlin[0].unverifiable && kotlin[0].required_min == "3.2.0");
+      CHECK(kotlin[1].spec == "33.0.0-jre");           // qualified version kept
+      CHECK(kotlin[2].name == "org.junit.jupiter:junit-jupiter");
+      CHECK(kotlin[3].unverifiable);                    // BOM-driven, no literal version
+      CHECK(kotlin[4].unverifiable);                    // "1.+" is dynamic, never satisfiable
+      CHECK(kotlin[4].required_min.empty());            // and must not claim ">= 1"
+      CHECK(kotlin[5].spec == "[2.14,3)" && kotlin[5].required_min == "2.14");  // range is a real floor
+    }
+    const auto groovy = parse_gradle_deps(R"(plugins { id 'java' }
+group = 'com.example'
+version = '1.0.0'
+dependencies {
+    implementation 'org.apache.commons:commons-lang3:3.14.0'
+    implementation group: 'commons-io', name: 'commons-io', version: '2.15.1'
+    implementation 'javax.inject:javax.inject'
+    providedCompile 'com.foo:provided:1.0'
+    runtimeOnly 'g:a:v:c'          // classifier form: not a plain coordinate
+}
+)");
+    CHECK(groovy.size() == 4);
+    if (groovy.size() == 4) {
+      CHECK(groovy[0].name == "org.apache.commons:commons-lang3");
+      CHECK(groovy[1].name == "commons-io:commons-io" && groovy[1].required_min == "2.15.1");  // map form
+      CHECK(groovy[2].unverifiable);
+      CHECK(groovy[3].name == "com.foo:provided");
+    }
+    // A non-dependency file must yield nothing.
+    CHECK(parse_gradle_deps(R"(plugins { id 'java' }
+version = '1.0.0'
+extra { println "gradle:not:a:dep" }
+)").empty());
+  }
+}
+
 int main() {
   test_json();
   test_util();
@@ -377,6 +518,7 @@ int main() {
   test_scan_and_snapshot();
   test_ecosystems();
   test_snapshot_ecosystem_roundtrip();
+  test_ecosystem_regressions();
   std::printf("%d checks, %d failed\n", g_run, g_fail);
   return g_fail ? 1 : 0;
 }
