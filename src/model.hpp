@@ -37,10 +37,23 @@ struct Tool {
 
 struct Library {
   std::string name;          // as written in the build files (SDL2, openssl, gtk+-3.0 ...)
-  std::string kind;          // cmake | pkg-config | make | meson
+  // cmake | pkg-config | make | meson for native linkage; pip | npm | cargo |
+  // maven | go for language packages. The ecosystem parsers in ecosystems.cpp
+  // own the second form.
+  std::string kind;
   std::string required_min;  // version constraint from the build files
+  // The constraint as written ("^4.18.0", ">=5.9,<7", "[1.0,2.0)"). Optional
+  // and absent from older snapshots; required_min is the derived lower bound
+  // that everything downstream actually compares against.
+  std::string spec;
+  // The exact version a lock file pinned, when the project ships one.
+  std::string version_locked;
+  // The declared version is something we cannot evaluate (a git URL, a maven
+  // ${property}, an npm workspace protocol). Checked for presence only, and
+  // the report must say so rather than imply the constraint was verified.
+  bool unverifiable = false;
   std::string version;       // version found on the developer's machine
-  std::string via;           // pkg-config | cmake-config | header | ldconfig
+  std::string via;           // pkg-config | cmake-config | header | ldconfig | site-packages | node_modules | ...
   bool required = true;
   bool found = false;        // found on the developer's machine at snapshot time
 };
@@ -66,6 +79,9 @@ struct FileHash {
 struct BuildInfo {
   std::vector<std::string> systems;    // cmake, make, meson, cargo, npm ...
   std::vector<std::string> languages;  // c++, c, rust, python ...
+  // Ecosystems whose packages this snapshot carries: pip, npm, cargo, maven,
+  // go. Empty means a native-only project, so an old snapshot is still valid.
+  std::vector<std::string> package_managers;
   std::string cxx_standard;            // "23"
   std::string c_standard;
   bool fetches_network = false;        // FetchContent / ExternalProject
