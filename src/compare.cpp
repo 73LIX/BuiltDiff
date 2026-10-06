@@ -354,7 +354,7 @@ void check_libraries(Ctx& c) {
           it.code = "PKG_TOO_NEW";
           it.title = std::string(eco_label(eco)) + " '" + l.name + "' " + p.version + " is newer than the project allows (" + want + ")";
           it.detail = "Usually fine, but an untested version can change behaviour.";
-        } else if (!l.version_locked.empty() && p.version != l.version_locked) {
+        } else if (!l.version_locked.empty() && !versions_match(p.version, l.version_locked)) {
           // A lock file is an exact pin. Minor drift is not a build failure but
           // it is worth seeing, so this warns rather than fails.
           it.status = Status::Warn;
