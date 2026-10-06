@@ -17,7 +17,7 @@ namespace bd {
 enum class Status { Ok, Info, Warn, Fail };
 
 struct Item {
-  std::string layer;  // system | toolchain | build | libraries | runtime
+  std::string layer;  // system | toolchain | build | libraries | packages | runtime
   Status status = Status::Ok;
   std::string code;   // machine readable, e.g. TOOL_MISSING
   std::string name;   // g++, SDL2, libssl.so.3, platform ...
@@ -27,6 +27,11 @@ struct Item {
   std::string you;    // this machine's value
   std::vector<std::string> pkgs;  // packages (for the local package manager) that fix it
   std::string hint;               // extra command / advice
+  // Where `hint` comes from. A language-package hint runs inside the project's
+  // own environment (pip/npm/cargo), not the system package manager, so the
+  // report must not fold it into the single "sudo pacman -S" line - installing
+  // a PyPI package with pacman would be wrong.
+  enum class HintScope { System, Local } hint_scope = HintScope::System;
 };
 
 struct Report {
