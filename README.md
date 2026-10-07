@@ -2,79 +2,49 @@
 
 > "It works on my machine" - BuiltDiff tells you why it doesn't work on yours.
 
-The developer runs `builtdiff snapshot` and commits a small `.builtdiff` file (an environment
-*fingerprint* of what the project needs: OS/arch, compilers, build tools, libraries, Python/npm/Cargo/Maven/Go
-dependencies, and the shared libraries and glibc symbol versions their binaries need). Users run `builtdiff check`
+This is something every developer might have experienced during their development journey quite a lot. <br>
+“If it works on my machine ~ it works” even though it doesn’t on the user ends - **Why? - Let BuiltDiff tell you.**
+
+BuiltDiff snapshots the environment your project needs to run and instantly compares it against any other machine, telling you exactly what's different and what to install.
+
+The developer runs `builtdiff snapshot` and commits a small `.builtdiff` file _(an environment
+fingerprint of what the project needs: OS/arch, compilers, build tools, libraries, Python/npm/Cargo/Maven/Go
+dependencies, and the shared libraries and glibc symbol versions their binaries need)_. <br> Users run `builtdiff check`
 and get an exact list of what differs on their machine. With `--analyze`, a **local open-weight Gemma model (via Ollama)** turns that
 list into a beginner-friendly explanation with fix steps. Nothing leaves your machine.
 
-Written in C++20, no third-party libraries (only the standard library and POSIX).
+## Installation (Linux)
 
-## Install on Arch Linux
-
+```bash
+curl -fsSL https://raw.githubusercontent.com/73LIX/BuiltDiff/main/install.sh | sh
+```
+### Build
 ```bash
 sudo pacman -S --needed base-devel cmake ninja git pkgconf
-git clone https://github.com/73LIX/BuiltDiff.git && cd builtdiff
+git clone https://github.com/73LIX/BuiltDiff.git && cd BuiltDiff
 cmake -S . -B build -G Ninja && cmake --build build
-ctest --test-dir build            # optional
-sudo cmake --install build        # installs /usr/local/bin/builtdiff
 ```
-Or build a package: `makepkg -si` (uses the included `PKGBUILD`, builds from the local checkout).
-
-### AI explanations (optional)
-```bash
-sudo pacman -S ollama             # or ollama-cuda / ollama-rocm
-sudo systemctl enable --now ollama
-ollama pull gemma4:e2b                # any chat-capable model works: gemma3:4b, gemma4:e2b, llama3.2 ...
-builtdiff check --analyze
-```
-BuiltDiff asks the server which models it has and picks one itself, so any installed tag works. Override with
-`--model`, `--host`, `$BUILTDIFF_MODEL`, `$OLLAMA_HOST`. Without Ollama the normal report still prints.
 
 ## Usage
 Developer:
 ```bash
-builtdiff init        # optional builtdiff.json: binaries / extra libs / extra tools to track
+builtdiff init        # writes builtdiff.json
 builtdiff snapshot    # writes .builtdiff
 git add .builtdiff && git commit -m "Add builtdiff snapshot"
 ```
 User:
 ```bash
 git clone https://github.com/userxyz/projectabc && cd projectabc
-builtdiff check              # exit status 1 if something is wrong
-builtdiff check --analyze    # + Gemma explanation
-builtdiff check --json       # for CI / scripts
+builtdiff check              # exit status 1 if something is wrong along with what is missing
+builtdiff check --analyze    # better, detailed response by any ollama model (gemma, mistral, deepseek, llama)
 ```
-
-## What is compared (layers)
-System (OS, arch, distro, libc) -> Toolchain (gcc/clang/cmake/make/ninja/python/node/rust/go..., C++ standard vs compiler)
--> Build system (build files changed since the snapshot) -> Libraries (pkg-config / CMake config / ldconfig)
--> Language packages -> Runtime (ELF `DT_NEEDED`, loader, `GLIBC_x.y` / `GLIBCXX_x.y` symbol versions; read by a
-bounds-checked parser, `ldd` is never run).
-Missing native packages are mapped to `pacman`, `apt` or `dnf` install commands.
-
-## Language packages
-Python, npm, Cargo, Maven and Go dependencies are read from the manifests (`requirements.txt`, `pyproject.toml`,
-`setup.py`, `package.json`, `Cargo.toml`, `pom.xml`, `go.mod`) and compared against what is actually installed.
-Lock files (`Cargo.lock`, `go.sum`) pin exact versions, and only names the project declares directly are reported.
-
-Installed versions are found by reading the filesystem: `site-packages` (respecting
-`include-system-site-packages = false` in `pyvenv.cfg`), `node_modules`, the Cargo registry, the Go module cache and
-`~/.m2`. **No subprocess is used for this** - `pip list` and friends are not in the tool allowlist and never will be,
-so the probes cannot execute project-controlled input.
-
-Because these packages belong to the project rather than to the system, their install hints are kept out of the
-distro `install_command` and reported separately, and in JSON each such item carries `"hint_scope": "project"`.
-
-Version constraints are evaluated with each ecosystem's own grammar (`^`, `~`, x-ranges, `>=1,<2`, `~=`, Maven
-`[1.0,2.0)`). A constraint that cannot be parsed - a git URL, a `${property}`, a `workspace:*` protocol - is reported
-as *unverifiable* rather than assumed satisfied, and a version above a range's ceiling is reported as newer-than-allowed
-instead of being silently called a pass.
+BuiltDiff asks the ollama server which models it has and picks one itself, so any installed tag works **(#Tested on gemma4:e2b)**. Override with
+`--model`, `--host`, `$BUILTDIFF_MODEL`, `$OLLAMA_HOST`. Without Ollama the normal report still prints.
 
 ## Privacy: What the snapshot contains
 Tool names + versions, library names + versions, platform, build-file hashes, ELF metadata. It does **not** contain
-user name, home path, hostname, environment variables, IP addresses, SSH keys or any file content. Home path, user and host
-names are redacted from the few strings that could carry them (e.g. compiler banners).
+user name, home path, hostname, environment variables, IP addresses, SSH keys or any file content.<br>
+Home path, user and host names are redacted from the few strings that could carry them (e.g. compiler banners).
 
 ## Security
 * A `.builtdiff` arrives with a cloned repo, so it is **untrusted**: bounded JSON parser (depth, size, duplicate keys),
@@ -88,11 +58,9 @@ names are redacted from the few strings that could carry them (e.g. compiler ban
   ASan/UBSan with `cmake -S . -B build-asan -DBUILTDIFF_SANITIZE=ON`.
 
 ## Performance
-Tool probes run in parallel; `check` on a typical project takes ~40 ms. Static binary of ~800 KB, no heap-heavy regex.
+Tool probes run in parallel; `check` on a typical project takes ~40 ms. <br>
+Fully static musl binaries (x86_64 and arm64) of ~840 KB, no heap-heavy regex.
 
-## Layout
-`src/` util, json, proc, elf, knowledge, sysinfo, scan, snapshot, compare, http, analyze, render, main - `tests/tests.cpp`.
-
-## Limitations (MVP)
-Linux is the fully supported platform for `snapshot`/`check` (macOS/Windows snapshots are *recognized* and reported as platform mismatches).
+## Linux Only
+Linux is the fully supported platform for `snapshot`/`check` (macOS/Windows snapshots are *recognized* and reported as platform mismatches).<br>
 Package-name tables cover common libraries only; unknown ones get a "find the owning package" hint.
