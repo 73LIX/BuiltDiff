@@ -2,8 +2,7 @@
 
 > "It works on my machine" - BuiltDiff tells you why it doesn't work on yours.
 
-<img width="1651" height="1053" alt="BuiltDiff" src="https://github.com/user-attachments/assets/754baba9-0956-44b5-b41e-175192670bdd" />
-[asciinema](https://asciinema.org/a/nvp0a31ohh4kmmgy)
+Asciinema link : https://asciinema.org/a/nvp0a31ohh4kmmgy
 
 This is something every developer might have experienced during their development journey quite a lot. <br>
 “If it works on my machine ~ it works” even though it doesn’t on the user ends - **Why? - Let BuiltDiff tell you.**
