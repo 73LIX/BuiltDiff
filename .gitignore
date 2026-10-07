@@ -3,3 +3,5 @@ build-asan/
 build-release-*/
 dist/
 packaging/
+*.cast
+*.gif
