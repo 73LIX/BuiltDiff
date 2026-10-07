@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <ranges>
 
 #include "json.hpp"
 #include "util.hpp"
@@ -920,9 +919,13 @@ std::vector<PkgSpec> parse_gradle_deps(std::string_view text) {
     return s;
   };
 
+  // The lines are trimmed here because split() keeps surrounding whitespace.
+  // (No `split(...) | views::transform(trim)` pipe: that form relies on the
+  // owning-view materialisation added by a newer libstdc++, and the musl
+  // toolchain used for release builds ships an older one.)
   std::vector<PkgSpec> out;
-  for (const auto& raw : split(text, '\n') | std::views::transform(trim)) {
-    std::string_view line = raw;
+  for (const auto& raw : split(text, '\n')) {
+    std::string_view line = trim(raw);
     if (line.empty()) continue;
     if (line[0] == '#' || line.rfind("//", 0) == 0 || line.rfind("/*", 0) == 0) continue;
     // The line must start with a known configuration name.

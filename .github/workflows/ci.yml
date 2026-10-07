@@ -1,0 +1,61 @@
+name: ci
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (ASan + UBSan)
+        run: cmake -S . -B build-asan -G Ninja -DBUILTDIFF_SANITIZE=ON
+      - name: Build
+        run: cmake --build build-asan
+      - name: Test under sanitizers
+        run: ctest --test-dir build-asan --output-on-failure
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-test, sanitize]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache musl toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/builtdiff-toolchain
+          key: musl-tc-v1
+      - name: Build static binaries and release assets
+        run: bash scripts/release-build.sh "${GITHUB_REF_NAME#v}"
+      - name: Publish GitHub Release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --title "builtdiff ${GITHUB_REF_NAME#v}" \
+            --notes "Static musl binaries for linux-x86_64 and linux-aarch64 (no runtime dependencies).
+
+            Install (SHA256 is verified against the attached checksums):
+
+              curl -fsSL https://raw.githubusercontent.com/73LIX/BuiltDiff/main/install.sh | sh
+
+            AI explanations need Ollama (optional). See README."
