@@ -10,7 +10,7 @@
 
 namespace bd {
 
-inline constexpr const char* kToolVersion = "0.1.0";
+inline constexpr const char* kToolVersion = "1.0.0";
 
 // ------------------------------------------------------------- strings
 std::string_view trim(std::string_view s) noexcept;
